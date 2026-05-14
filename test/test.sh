@@ -65,8 +65,13 @@ assert_allow() {
 echo "=== Pass-through subcommands ==="
 assert_exit "--version" 0 --version
 assert_exit "--help" 0 --help
-assert_exit "auth status" 0 auth status
-assert_exit "extension list" 0 extension list
+# `auth status` and `extension list` are pass-through tests — the filter should
+# exec real gh without inspecting. The point is "filter doesn't block" (exit ≠ 77),
+# not "real gh succeeds" (exit 0). On CI the runner is unauthenticated and the gh
+# extensions list is empty, so the real exit codes are 1 and 4 respectively. Use
+# assert_allow which checks "not blocked" rather than asserting a specific exit.
+assert_allow "auth status"     auth status
+assert_allow "extension list"  extension list
 
 echo ""
 echo "=== Block: third-party --repo flag ==="
