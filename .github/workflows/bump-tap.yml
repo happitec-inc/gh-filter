@@ -1,0 +1,19 @@
+name: Bump Homebrew Tap
+
+# When a `vX.Y.Z` tag is pushed, open a PR on happitec-inc/homebrew-tap
+# (the public-facing tap) bumping Formula/gh-filter.rb's tag + revision
+# pins to this commit. The reusable workflow handles the rest.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  bump:
+    uses: happitec-inc/public-actions/.github/workflows/bump-tap-formula.yml@main
+    secrets: inherit
+    with:
+      runner: ${{ vars.RUNNER_LINUX || '["ubuntu-latest"]' }}

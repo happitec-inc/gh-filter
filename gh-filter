@@ -1,0 +1,304 @@
+#!/bin/bash
+# gh-filter: shim for `gh` that enforces an owner allowlist on every invocation.
+#
+# Installed by the gh-filter brew formula at `$(brew --prefix gh-filter)/libexec/gh-filter`.
+# The user activates the filter by prepending `$(brew --prefix gh-filter)/libexec/shim`
+# to PATH, which makes `gh` resolve to a shim that execs this script. The real gh binary
+# stays at `$(brew --prefix gh)/bin/gh` and is auto-resolved from the brew cellar at
+# runtime (or via the `GH_FILTER_REAL_GH` env var).
+#
+# On allow: exec real gh with the original args.
+# On block: print a verbose error to stderr, send a Pushover notification
+#           via `notify` (if installed), and exit 77.
+#
+# The allowlist is configured by the operator — see README. Reads against
+# third-party public repos remain available via `curl https://api.github.com/...`
+# directly (the filter only mediates `gh`, not `curl`).
+
+set -uo pipefail
+
+# ---- Configuration ----------------------------------------------------------
+
+# Allowlist comes from a config file at `~/.config/gh-filter/config` (XDG
+# default; override with GH_FILTER_CONFIG). Format is `KEY=VALUE`:
+#
+#     ALLOWED_OWNERS=owner1,owner2,owner3
+#
+# Default is empty — with no config file in place, every repo-targeted `gh`
+# invocation is blocked. This is intentional: an unconfigured filter should
+# fail closed.
+GH_FILTER_CONFIG="${GH_FILTER_CONFIG:-$HOME/.config/gh-filter/config}"
+
+ALLOWED_OWNERS=()
+if [ -f "$GH_FILTER_CONFIG" ]; then
+  raw=$(/usr/bin/sed -n -E 's/^[[:space:]]*ALLOWED_OWNERS[[:space:]]*=[[:space:]]*(.*)$/\1/p' "$GH_FILTER_CONFIG" | /usr/bin/tail -1)
+  if [ -n "$raw" ]; then
+    # Strip optional surrounding quotes.
+    raw="${raw#\"}"; raw="${raw%\"}"
+    raw="${raw#\'}"; raw="${raw%\'}"
+    IFS=',' read -ra parts <<< "$raw"
+    for p in "${parts[@]}"; do
+      # Trim leading/trailing whitespace.
+      trimmed="${p#"${p%%[![:space:]]*}"}"
+      trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+      [ -n "$trimmed" ] && ALLOWED_OWNERS+=("$trimmed")
+    done
+  fi
+fi
+
+# Resolve the `notify` binary for Pushover alerts. Default: PATH lookup.
+# Override with GH_FILTER_NOTIFY if notify lives outside PATH.
+NOTIFY="${GH_FILTER_NOTIFY:-$(command -v notify 2>/dev/null)}"
+
+# Resolve the real gh binary. Prefer the env override, otherwise pick the
+# highest version directory in /opt/homebrew/Cellar/gh.
+REAL_GH="${GH_FILTER_REAL_GH:-}"
+if [ -z "$REAL_GH" ] || [ ! -x "$REAL_GH" ]; then
+  CANDIDATE_DIR=$(/bin/ls -1 /opt/homebrew/Cellar/gh 2>/dev/null | /usr/bin/sort -V | /usr/bin/tail -1)
+  if [ -n "$CANDIDATE_DIR" ]; then
+    REAL_GH="/opt/homebrew/Cellar/gh/${CANDIDATE_DIR}/bin/gh"
+  fi
+fi
+if [ -z "$REAL_GH" ] || [ ! -x "$REAL_GH" ]; then
+  /bin/echo "gh-filter: FATAL — real gh binary not found. Set GH_FILTER_REAL_GH or reinstall gh." >&2
+  exit 70
+fi
+
+# ---- Helpers ----------------------------------------------------------------
+
+ORIGINAL_ARGS=("$@")
+
+emit_block_message() {
+  local detected_target="$1"
+  local reason="$2"
+  local cmd_preview="gh"
+  for a in "${ORIGINAL_ARGS[@]}"; do
+    cmd_preview+=" $(printf '%q' "$a")"
+  done
+
+  /bin/cat >&2 <<EOF
+================================================================
+gh-filter: BLOCKED — target owner outside allowlist
+================================================================
+Attempted:       ${cmd_preview}
+Detected target: ${detected_target:-<could not determine>}
+Reason:          ${reason}
+Allowed owners:  ${ALLOWED_OWNERS[*]:-<none configured>}
+Config file:     ${GH_FILTER_CONFIG}
+
+This shim wraps 'gh' to refuse any invocation that targets a repo outside
+the configured allowlist. Reads against third-party public repos remain
+fine via 'curl https://api.github.com/repos/<owner>/<name>/...' directly.
+
+If you genuinely need this interaction, STOP and ask the operator first.
+Wait for explicit, action-scoped approval before retrying.
+
+DO NOT BYPASS. Calling the real gh by absolute path, raw curl with a bot
+token, or 'git push' to a foreign remote are SEPARATE escalated violations.
+Bypass attempts are also subject to phone notification.
+================================================================
+EOF
+}
+
+send_notification() {
+  local detected_target="$1"
+  local reason="$2"
+  if [ -z "$NOTIFY" ] || [ ! -x "$NOTIFY" ]; then
+    return
+  fi
+  local short_cmd="gh ${ORIGINAL_ARGS[*]}"
+  if [ "${#short_cmd}" -gt 200 ]; then
+    short_cmd="${short_cmd:0:200}..."
+  fi
+  "$NOTIFY" --message "gh-filter blocked: target=${detected_target:-unknown} reason=${reason} cmd=${short_cmd}" >/dev/null 2>&1 || true
+}
+
+deny() {
+  local detected_target="$1"
+  local reason="$2"
+  emit_block_message "$detected_target" "$reason"
+  send_notification "$detected_target" "$reason"
+  exit 77
+}
+
+is_allowed_owner() {
+  local owner="$1"
+  # bash 3.2 + `set -u` treats `"${arr[@]}"` on an empty array as unbound;
+  # guard explicitly so an unconfigured filter falls through to deny() with
+  # a proper block message, not a crash.
+  if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
+    return 1
+  fi
+  for allowed in "${ALLOWED_OWNERS[@]}"; do
+    [ "$owner" = "$allowed" ] && return 0
+  done
+  return 1
+}
+
+# ---- Subcommand pass-through gates ------------------------------------------
+
+# No args: show gh's default help.
+if [ $# -eq 0 ]; then
+  exec "$REAL_GH"
+fi
+
+# Top-level meta flags.
+case "${1:-}" in
+  --version|-v|--help|-h)
+    exec "$REAL_GH" "$@"
+    ;;
+esac
+
+SUBCMD="${1:-}"
+
+# Subcommands that don't touch a target repo. These read-only / local-state
+# operations pass through unchecked.
+case "$SUBCMD" in
+  help|completion|config|status|alias|gpg-key|ssh-key|codespace|cache|attestation|variable|secret)
+    # Note: variable/secret commands DO touch repos. We fall through to repo
+    # detection below if they have --repo, by NOT exec-ing here.
+    case "$SUBCMD" in
+      help|completion|config|status|alias|gpg-key|ssh-key|cache)
+        exec "$REAL_GH" "$@"
+        ;;
+    esac
+    ;;
+  auth)
+    # All auth-state operations: login, logout, refresh, status, setup-git,
+    # token, switch.
+    exec "$REAL_GH" "$@"
+    ;;
+  extension)
+    case "${2:-}" in
+      install|upgrade|remove|create|browse)
+        deny "extension:$2" "extension state changes are blocked; install manually if needed"
+        ;;
+      list|search|exec|"")
+        exec "$REAL_GH" "$@"
+        ;;
+      *)
+        exec "$REAL_GH" "$@"
+        ;;
+    esac
+    ;;
+esac
+
+# Explicit block: `gh api graphql` can target any repo via the query body,
+# which we can't reliably parse. Refuse it outright.
+if [ "$SUBCMD" = "api" ]; then
+  for a in "$@"; do
+    if [ "$a" = "graphql" ]; then
+      deny "<graphql>" "gh api graphql is blocked (query body can target any repo)"
+    fi
+  done
+fi
+
+# ---- Target repo detection --------------------------------------------------
+
+TARGET_REPO=""
+
+# 1. --repo OWNER/NAME, -R OWNER/NAME, --repo=OWNER/NAME, -R=OWNER/NAME
+i=0
+args=("$@")
+while [ $i -lt ${#args[@]} ]; do
+  a="${args[$i]}"
+  case "$a" in
+    --repo|-R)
+      if [ $((i+1)) -lt ${#args[@]} ]; then
+        TARGET_REPO="${args[$((i+1))]}"
+      fi
+      break
+      ;;
+    --repo=*)
+      TARGET_REPO="${a#--repo=}"
+      break
+      ;;
+    -R=*)
+      TARGET_REPO="${a#-R=}"
+      break
+      ;;
+  esac
+  i=$((i+1))
+done
+
+# 2. `gh api`: extract /repos/OWNER/NAME from a path arg.
+if [ -z "$TARGET_REPO" ] && [ "$SUBCMD" = "api" ]; then
+  for a in "$@"; do
+    if [[ "$a" =~ ^/?repos/([^/]+)/([^/?#]+) ]]; then
+      TARGET_REPO="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+      break
+    fi
+  done
+fi
+
+# 3. `gh repo <verb> OWNER/NAME` positional form.
+if [ -z "$TARGET_REPO" ] && [ "$SUBCMD" = "repo" ]; then
+  for a in "${@:3}"; do
+    case "$a" in
+      -*) continue ;;
+      */*)
+        if [[ "$a" =~ ^([^/]+)/([^/]+)$ ]]; then
+          TARGET_REPO="$a"
+          break
+        fi
+        ;;
+    esac
+  done
+fi
+
+# 4. Fallback: current directory's git remote. Not consulted for `gh api`,
+# because there the API path itself (or the absence of one) is the source of
+# truth — meta-paths like `/user` should be evaluated against the api-block
+# rules below, not the cwd's remote.
+if [ -z "$TARGET_REPO" ] && [ "$SUBCMD" != "api" ]; then
+  REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
+  if [ -n "$REMOTE_URL" ]; then
+    # Strip trailing /  and .git, then extract OWNER/NAME from the URL tail.
+    # Handles: git@github.com:OWNER/NAME(.git), https://github.com/OWNER/NAME(.git),
+    # https://x-access-token:TOKEN@github.com/OWNER/NAME(.git),
+    # ssh://git@github.com/OWNER/NAME(.git)
+    clean_url="${REMOTE_URL%/}"
+    clean_url="${clean_url%.git}"
+    if [[ "$clean_url" =~ github\.com[:/]([^/]+)/([^/]+)$ ]]; then
+      TARGET_REPO="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+  fi
+fi
+
+# ---- Allowlist gate ---------------------------------------------------------
+
+if [ -n "$TARGET_REPO" ]; then
+  OWNER="${TARGET_REPO%%/*}"
+  if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
+    deny "$TARGET_REPO" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
+  fi
+  if is_allowed_owner "$OWNER"; then
+    exec "$REAL_GH" "$@"
+  fi
+  deny "$TARGET_REPO" "owner '$OWNER' is not in the allowed list"
+fi
+
+# No target detected. If this is a `gh api` call to a non-repo path, allow it
+# when it matches either a GitHub-wide meta path or an `/orgs/<allowed-owner>`
+# path for a configured allowlist owner.
+if [ "$SUBCMD" = "api" ]; then
+  for a in "$@"; do
+    case "$a" in
+      /user|/users/*|/search/*|/rate_limit|/meta|/octocat|/zen|/emojis|/licenses|/licenses/*|/gitignore|/gitignore/*|/app|/app/*|/installation|/installation/*|/markdown|/markdown/*|/feeds|/notifications|/notifications/*)
+        exec "$REAL_GH" "$@"
+        ;;
+    esac
+    if [ "${#ALLOWED_OWNERS[@]}" -gt 0 ]; then
+      for owner in "${ALLOWED_OWNERS[@]}"; do
+        if [ "$a" = "/orgs/$owner" ] || [[ "$a" == /orgs/"$owner"/* ]]; then
+          exec "$REAL_GH" "$@"
+        fi
+      done
+    fi
+  done
+  # `gh api` against an unrecognized path with no /repos/ prefix → refuse.
+  deny "" "gh api path did not match any allowed pattern; pass /repos/<allowed-owner>/<name>/... or a meta path (/user, /orgs/<allowed>/...)"
+fi
+
+# Couldn't determine target, not a pass-through subcommand → refuse, suggest --repo.
+deny "" "could not determine target repo from arguments or current git remote; pass --repo OWNER/NAME explicitly"

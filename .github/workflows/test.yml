@@ -1,0 +1,26 @@
+name: Test
+
+# Run the bash test harness (`./test/test.sh`) on every PR and on push to main.
+# Uses the reusable bash-test workflow in public-actions so this stays a
+# one-line opt-in and benefits from any future improvements (caching,
+# matrix builds, etc.) without touching this file.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "test-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: happitec-inc/public-actions/.github/workflows/bash-test.yml@main
+    permissions:
+      contents: read
+    with:
+      runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
