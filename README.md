@@ -90,6 +90,41 @@ Target repo detection sources, in order:
 
 If no target can be determined and the subcommand isn't a recognized no-repo operation (`auth status`, `--version`, `api /user`, etc.), the call is refused with a suggestion to pass `--repo` explicitly.
 
+## Agent-identity injection (optional)
+
+By default gh-filter only decides *whether* a call is allowed (the owner allowlist). It can optionally also decide *which identity* a call runs as — so automated ("agent") invocations authenticate with a token you supply, while your own interactive `gh` is left completely untouched.
+
+This exists because `gh` with no explicit token falls back to whatever account is logged in via `gh auth login`. On a shared machine where both a human and automated agents invoke `gh` as the same OS user, every agent call silently spends the human's API rate-limit budget and acts as the human's identity. The identity stage closes that: it detects an agent context and swaps in a dedicated token.
+
+### Configuration
+
+Two optional keys in `~/.config/gh-filter/config`. The feature is **off unless `AGENT_TOKEN_COMMAND` is set** — with it unset, the identity stage is a complete no-op and gh-filter behaves as a pure owner-allowlist.
+
+```
+AGENT_TOKEN_COMMAND=/path/to/print-a-token       # command whose stdout is a token
+AGENT_MARKER_ENVS=CLAUDECODE                      # env vars that mark an agent context
+```
+
+- **`AGENT_TOKEN_COMMAND`** — a single executable that prints a token to stdout (for example, a script that mints a short-lived GitHub App installation token). Run with no arguments; it **must not itself invoke `gh`** (that would recurse through this shim). If it is missing, errors, or prints nothing, the call **fails closed** (exit 78) rather than falling back to the ambient credential.
+- **`AGENT_MARKER_ENVS`** — comma-separated list of environment variable *names*. If any is present and non-empty, the invocation is treated as an agent context. `CLAUDECODE` is the marker [Claude Code](https://docs.claude.com/en/docs/claude-code) sets in every tool subprocess; other harnesses set their own (add them here). An interactive human shell has none of these.
+
+Both may also be supplied via the `GH_FILTER_AGENT_TOKEN_COMMAND` / `GH_FILTER_AGENT_MARKER_ENVS` environment variables (which take precedence — handy for tests).
+
+### Precedence
+
+When `AGENT_TOKEN_COMMAND` is configured, each call resolves identity in this order, *before* the allowlist gate:
+
+1. **Caller already set `GH_TOKEN` or `GITHUB_TOKEN`** → honored as-is, nothing injected. (Preserves explicit `GH_TOKEN=$(...) gh ...` calls, and is the escape hatch to force a specific identity — including your own.)
+2. **Agent context** (a marker env is set) → inject `AGENT_TOKEN_COMMAND`'s token.
+3. **Interactive human** (stderr is a TTY) → leave the ambient credential untouched; you stay yourself.
+4. **Neither** (detached process, cron, scrubbed environment — no token, no marker, no TTY) → **fail closed to `AGENT_TOKEN_COMMAND`**, never the ambient credential. A background job that lost its markers can never silently spend the human's budget.
+
+Identity selection and the owner-allowlist are separate stages, and the allowlist stays the **final** gate — injecting a token never bypasses blast-radius protection.
+
+### Note on cost
+
+The identity stage runs `AGENT_TOKEN_COMMAND` on every agent-context call, **with no caching**. If your command performs a network round-trip (e.g. minting an installation token), every agent `gh` call pays that latency. Caching is intentionally not built in yet; wrap your command with your own cache if the cost matters.
+
 ## Subcommands always passed through (no repo check)
 
 - `--version`, `--help`, `-v`, `-h`
@@ -120,13 +155,23 @@ Brew removes the formula's files cleanly. The `export PATH=...` line in `~/.zshr
 
 ## Configuration
 
-The allowlist lives in a config file (see Installation above). The script also reads two environment variables at runtime:
+The config file holds `KEY=VALUE` lines. Recognized keys:
 
-| Variable             | Default                                              | Meaning                                  |
-|----------------------|------------------------------------------------------|------------------------------------------|
-| `GH_FILTER_CONFIG`   | `~/.config/gh-filter/config`                         | Path to the allowlist config file        |
-| `GH_FILTER_REAL_GH`  | highest-version `gh` in `/opt/homebrew/Cellar/gh/`   | Path to the real `gh` binary to exec     |
-| `GH_FILTER_NOTIFY`   | resolved from `$PATH` via `command -v notify`        | Path to the `notify` binary (Pushover)   |
+| Config key            | Meaning                                                                 |
+|-----------------------|-------------------------------------------------------------------------|
+| `ALLOWED_OWNERS`      | Comma-separated owner allowlist (required for repo-targeted calls)      |
+| `AGENT_TOKEN_COMMAND` | Optional. Command whose stdout is the token to inject for agent calls   |
+| `AGENT_MARKER_ENVS`   | Optional. Comma-separated env-var names marking an agent context        |
+
+The script also reads these environment variables at runtime (each overrides the corresponding config key or default):
+
+| Variable                          | Default                                              | Meaning                                       |
+|-----------------------------------|------------------------------------------------------|-----------------------------------------------|
+| `GH_FILTER_CONFIG`                | `~/.config/gh-filter/config`                         | Path to the config file                       |
+| `GH_FILTER_REAL_GH`               | highest-version `gh` in `/opt/homebrew/Cellar/gh/`   | Path to the real `gh` binary to exec          |
+| `GH_FILTER_NOTIFY`                | resolved from `$PATH` via `command -v notify`        | Path to the `notify` binary (Pushover)        |
+| `GH_FILTER_AGENT_TOKEN_COMMAND`   | value of `AGENT_TOKEN_COMMAND` in config             | Override the agent token command              |
+| `GH_FILTER_AGENT_MARKER_ENVS`     | value of `AGENT_MARKER_ENVS` in config               | Override the agent marker env list            |
 
 If `notify` isn't installed or isn't found, the filter silently skips the Pushover alert and still blocks the call. The phone alert is best-effort, not a precondition for enforcement.
 
@@ -149,6 +194,7 @@ The block message reminds operators that these are **separate, escalated violati
 | `1`+ | Real `gh` ran and exited with that code       |
 | `70` | gh-filter: real `gh` binary not found         |
 | `77` | gh-filter: invocation blocked by the filter   |
+| `78` | gh-filter: agent identity could not be resolved (fail-closed) |
 
 ## The Pushover notification
 
