@@ -284,6 +284,23 @@ ec=$?
 if [ "$ec" = "78" ]; then PASS=$((PASS+1)); echo "PASS: empty token output → exit 78 (fail-closed)"; \
   else FAIL=$((FAIL+1)); echo "FAIL: empty token output — expected 78, got $ec"; fi
 
+# 6b. Re-entry guard: a misconfigured AGENT_TOKEN_COMMAND that itself shells out
+#     to `gh` (without providing a token) must fail closed (exit 78), never loop.
+RECURSE_CMD="$IDENT_DIR/recurse-cmd"
+/bin/cat > "$RECURSE_CMD" <<EOF
+#!/bin/bash
+# Simulate a token command that (wrongly) invokes gh — recurses through the shim.
+env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$RECURSE_CMD" \\
+    GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 "$FILTER" api /user
+EOF
+/bin/chmod +x "$RECURSE_CMD"
+env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$RECURSE_CMD" \
+    GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 \
+    "$FILTER" api /user >/dev/null 2>&1
+ec=$?
+if [ "$ec" = "78" ]; then PASS=$((PASS+1)); echo "PASS: token command recursing into gh → exit 78 (guard, no loop)"; \
+  else FAIL=$((FAIL+1)); echo "FAIL: re-entry guard — expected 78, got $ec"; fi
+
 # 7. Human interactive (stderr is a TTY) → NO injection; ambient credential kept.
 #    Allocate a pty via `script` so `[ -t 2 ]` is true. Best-effort: if `script`
 #    is unavailable the case is skipped rather than failing the suite.

@@ -203,7 +203,9 @@ inject_agent_token() {
     /bin/echo "gh-filter: FATAL — AGENT_TOKEN_COMMAND ('$AGENT_TOKEN_COMMAND') is not executable; refusing to fall back to the ambient credential." >&2
     exit 78
   fi
-  tok=$("$AGENT_TOKEN_COMMAND" 2>/dev/null)
+  # Mark the token command's environment so a nested `gh` (if the command
+  # misbehaves and shells out to gh) is detected as re-entry, not run again.
+  tok=$(GH_FILTER_RESOLVING_IDENTITY=1 "$AGENT_TOKEN_COMMAND" 2>/dev/null)
   if [ -z "$tok" ]; then
     /bin/echo "gh-filter: FATAL — AGENT_TOKEN_COMMAND produced no token; refusing to fall back to the ambient credential." >&2
     exit 78
@@ -221,6 +223,13 @@ resolve_identity() {
   [ -n "$AGENT_TOKEN_COMMAND" ] || return 0
   if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
     return 0
+  fi
+  # Re-entry guard: past this point we may run AGENT_TOKEN_COMMAND. If we are
+  # ALREADY inside one (it shelled out to gh without providing a token), that is
+  # unbounded recursion — fail closed with a clear error instead of looping.
+  if [ -n "${GH_FILTER_RESOLVING_IDENTITY:-}" ]; then
+    /bin/echo "gh-filter: FATAL — AGENT_TOKEN_COMMAND invoked 'gh' without providing a token, which recurses through this shim. The token command must not call gh (use curl or a native API client)." >&2
+    exit 78
   fi
   if in_agent_context; then
     inject_agent_token
