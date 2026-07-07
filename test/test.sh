@@ -201,6 +201,108 @@ else
 fi
 
 echo ""
+echo "=== Agent-identity injection ==="
+# Stub "real gh" that reports the GH_TOKEN it was handed, so injection is
+# directly observable. Stub token command that emits a fixed token.
+IDENT_DIR=$(/usr/bin/mktemp -d)
+STUB_GH="$IDENT_DIR/stub-gh"
+TOK_CMD="$IDENT_DIR/tok-cmd"
+EMPTY_TOK_CMD="$IDENT_DIR/empty-tok-cmd"
+/bin/cat > "$STUB_GH" <<'EOF'
+#!/bin/bash
+echo "REALGH_TOKEN=${GH_TOKEN:-<none>}"
+exit 0
+EOF
+/bin/cat > "$TOK_CMD" <<'EOF'
+#!/bin/bash
+echo "injected-token-xyz"
+EOF
+/bin/cat > "$EMPTY_TOK_CMD" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+/bin/chmod +x "$STUB_GH" "$TOK_CMD" "$EMPTY_TOK_CMD"
+
+# assert_stdout LABEL EXPECTED_SUBSTRING -- <env KEY=VAL ...> -- <gh args...>
+# Runs the filter with the given env, captures stdout, checks the substring.
+assert_ident() {
+  local label="$1" expect="$2"; shift 2
+  local out
+  out=$("$@" 2>/dev/null)
+  if [[ "$out" == *"$expect"* ]]; then
+    PASS=$((PASS+1)); echo "PASS: $label"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: $label  (wanted substring '$expect', got '$out')"
+  fi
+}
+
+# 1. Agent context (marker set) → token injected.
+assert_ident "agent marker → token injected" "REALGH_TOKEN=injected-token-xyz" \
+  env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$TOK_CMD" \
+      GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 \
+      "$FILTER" api /user
+
+# 2. Caller-set GH_TOKEN is honored (never overridden), even in agent context.
+assert_ident "caller GH_TOKEN honored over injection" "REALGH_TOKEN=caller-abc" \
+  env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$TOK_CMD" \
+      GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 GH_TOKEN=caller-abc \
+      "$FILTER" api /user
+
+# 2b. Caller-set GITHUB_TOKEN is also honored (gh reads both).
+assert_ident "caller GITHUB_TOKEN honored" "REALGH_TOKEN=<none>" \
+  env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$TOK_CMD" \
+      GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 GITHUB_TOKEN=gh-abc \
+      "$FILTER" api /user
+# (GITHUB_TOKEN set → stage returns early, injects nothing → stub sees no GH_TOKEN)
+
+# 3. Non-agent, non-TTY (detached/cron) → FAIL CLOSED to the bot token, never
+#    the ambient credential. In this harness stderr is not a TTY, so rule 4 fires.
+assert_ident "no marker + no TTY → fail-closed to bot token" "REALGH_TOKEN=injected-token-xyz" \
+  env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$TOK_CMD" \
+      GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER \
+      "$FILTER" api /user
+
+# 4. Feature OFF (no AGENT_TOKEN_COMMAND) → stage is a no-op even if a marker is
+#    present; the ambient credential passes through untouched.
+assert_ident "feature off → no injection (ambient credential)" "REALGH_TOKEN=<none>" \
+  env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 \
+      "$FILTER" api /user
+
+# 5. Fail-closed: AGENT_TOKEN_COMMAND missing/not executable → exit 78, no exec.
+env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$IDENT_DIR/does-not-exist" \
+    GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 \
+    "$FILTER" api /user >/dev/null 2>&1
+ec=$?
+if [ "$ec" = "78" ]; then PASS=$((PASS+1)); echo "PASS: missing token command → exit 78 (fail-closed)"; \
+  else FAIL=$((FAIL+1)); echo "FAIL: missing token command — expected 78, got $ec"; fi
+
+# 6. Fail-closed: AGENT_TOKEN_COMMAND runs but emits nothing → exit 78, no exec.
+env GH_FILTER_REAL_GH="$STUB_GH" GH_FILTER_AGENT_TOKEN_COMMAND="$EMPTY_TOK_CMD" \
+    GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER TEST_MARKER=1 \
+    "$FILTER" api /user >/dev/null 2>&1
+ec=$?
+if [ "$ec" = "78" ]; then PASS=$((PASS+1)); echo "PASS: empty token output → exit 78 (fail-closed)"; \
+  else FAIL=$((FAIL+1)); echo "FAIL: empty token output — expected 78, got $ec"; fi
+
+# 7. Human interactive (stderr is a TTY) → NO injection; ambient credential kept.
+#    Allocate a pty via `script` so `[ -t 2 ]` is true. Best-effort: if `script`
+#    is unavailable the case is skipped rather than failing the suite.
+if command -v script >/dev/null 2>&1; then
+  tty_out=$(script -q /dev/null env GH_FILTER_REAL_GH="$STUB_GH" \
+      GH_FILTER_AGENT_TOKEN_COMMAND="$TOK_CMD" GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER \
+      "$FILTER" api /user 2>/dev/null | /usr/bin/tr -d '\r')
+  if [[ "$tty_out" == *"REALGH_TOKEN=<none>"* ]]; then
+    PASS=$((PASS+1)); echo "PASS: human TTY (no marker) → no injection, ambient credential"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: human TTY passthrough  (got '$tty_out')"
+  fi
+else
+  echo "SKIP: human-TTY test (no 'script' binary to allocate a pty)"
+fi
+
+/bin/rm -rf "$IDENT_DIR"
+
+echo ""
 echo "================================================================"
 echo "Total: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
 echo "================================================================"

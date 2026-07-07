@@ -46,6 +46,40 @@ if [ -f "$GH_FILTER_CONFIG" ]; then
   fi
 fi
 
+# Optional agent-identity injection (see README §"Agent-identity injection").
+# Two keys, both read from the same config file (env override in parens, which
+# takes precedence and is handy for tests):
+#
+#   AGENT_TOKEN_COMMAND=/path/to/token-cmd   (GH_FILTER_AGENT_TOKEN_COMMAND)
+#   AGENT_MARKER_ENVS=CLAUDECODE,OTHER_VAR   (GH_FILTER_AGENT_MARKER_ENVS)
+#
+# AGENT_TOKEN_COMMAND names a command whose stdout is a token to inject as
+# GH_TOKEN for non-human ("agent") invocations. AGENT_MARKER_ENVS lists the env
+# vars whose presence marks such an invocation. When AGENT_TOKEN_COMMAND is
+# unset the entire identity stage is a no-op and the filter behaves as a pure
+# owner-allowlist — the feature is strictly opt-in.
+_read_cfg_scalar() {
+  # _read_cfg_scalar KEY → prints the (last) configured value, quotes stripped.
+  local key="$1" raw=""
+  [ -f "$GH_FILTER_CONFIG" ] || { printf ''; return 0; }
+  raw=$(/usr/bin/sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(.*)$/\1/p" "$GH_FILTER_CONFIG" | /usr/bin/tail -1)
+  raw="${raw#\"}"; raw="${raw%\"}"; raw="${raw#\'}"; raw="${raw%\'}"
+  printf '%s' "$raw"
+}
+
+AGENT_TOKEN_COMMAND="${GH_FILTER_AGENT_TOKEN_COMMAND:-$(_read_cfg_scalar AGENT_TOKEN_COMMAND)}"
+
+AGENT_MARKER_ENVS=()
+_marker_raw="${GH_FILTER_AGENT_MARKER_ENVS:-$(_read_cfg_scalar AGENT_MARKER_ENVS)}"
+if [ -n "$_marker_raw" ]; then
+  IFS=',' read -ra _marker_parts <<< "$_marker_raw"
+  for _m in "${_marker_parts[@]}"; do
+    _m="${_m#"${_m%%[![:space:]]*}"}"
+    _m="${_m%"${_m##*[![:space:]]}"}"
+    [ -n "$_m" ] && AGENT_MARKER_ENVS+=("$_m")
+  done
+fi
+
 # Resolve the `notify` binary for Pushover alerts. Default: PATH lookup.
 # Override with GH_FILTER_NOTIFY if notify lives outside PATH.
 NOTIFY="${GH_FILTER_NOTIFY:-$(command -v notify 2>/dev/null)}"
@@ -134,6 +168,72 @@ is_allowed_owner() {
   done
   return 1
 }
+
+# ---- Agent-identity resolution ----------------------------------------------
+# This stage decides WHICH identity a call runs as; the allowlist gate below
+# decides WHETHER the call is permitted. Two separate jobs, two separate stages,
+# and the allowlist stays the final gate — identity selection can never bypass
+# blast-radius protection.
+
+# True (0) when any configured marker env var is set and non-empty — i.e. this
+# invocation is an agent/automation context, not an interactive human shell.
+in_agent_context() {
+  [ "${#AGENT_MARKER_ENVS[@]}" -eq 0 ] && return 1
+  local name
+  # Indirect expansion of an unset var trips `set -u`; relax it just here.
+  set +u
+  for name in "${AGENT_MARKER_ENVS[@]}"; do
+    if [ -n "${!name}" ]; then
+      set -u
+      return 0
+    fi
+  done
+  set -u
+  return 1
+}
+
+# Run AGENT_TOKEN_COMMAND and export its stdout as GH_TOKEN. Fails CLOSED: if the
+# command is missing, errors, or prints nothing, abort (exit 78) — never fall
+# through to the ambient (human) credential, which is the leak this stage exists
+# to prevent. The command must be a single executable that prints a token and
+# must NOT itself invoke `gh` (that would recurse through this shim).
+inject_agent_token() {
+  local tok=""
+  if [ ! -x "$AGENT_TOKEN_COMMAND" ] && ! command -v "$AGENT_TOKEN_COMMAND" >/dev/null 2>&1; then
+    /bin/echo "gh-filter: FATAL — AGENT_TOKEN_COMMAND ('$AGENT_TOKEN_COMMAND') is not executable; refusing to fall back to the ambient credential." >&2
+    exit 78
+  fi
+  tok=$("$AGENT_TOKEN_COMMAND" 2>/dev/null)
+  if [ -z "$tok" ]; then
+    /bin/echo "gh-filter: FATAL — AGENT_TOKEN_COMMAND produced no token; refusing to fall back to the ambient credential." >&2
+    exit 78
+  fi
+  export GH_TOKEN="$tok"
+}
+
+# Identity precedence, evaluated only when AGENT_TOKEN_COMMAND is configured
+# (otherwise a complete no-op — pure owner-allowlist behavior, unchanged):
+#   1. caller already set GH_TOKEN/GITHUB_TOKEN → honor it, inject nothing
+#   2. agent context (a marker env is set)      → inject AGENT_TOKEN_COMMAND
+#   3. interactive human (stderr is a TTY)      → leave the ambient credential
+#   4. neither (detached/cron/scrubbed env)     → fail closed to AGENT_TOKEN_COMMAND
+resolve_identity() {
+  [ -n "$AGENT_TOKEN_COMMAND" ] || return 0
+  if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+    return 0
+  fi
+  if in_agent_context; then
+    inject_agent_token
+  elif [ -t 2 ]; then
+    return 0
+  else
+    inject_agent_token
+  fi
+}
+
+# Resolve identity before any exec below, so every pass-through and allow path
+# (auth status, api meta-paths, allowlisted repos) carries the resolved token.
+resolve_identity
 
 # ---- Subcommand pass-through gates ------------------------------------------
 
