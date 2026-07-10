@@ -392,21 +392,32 @@ fi
 # path for a configured allowlist owner.
 if [ "$SUBCMD" = "api" ]; then
   for a in "$@"; do
+    # `gh api` accepts a meta/orgs path with OR without a leading slash
+    # (e.g. `orgs/OWNER/repos` == `/orgs/OWNER/repos`, `licenses/mit` ==
+    # `/licenses/mit`). Normalise to the leading-slash form for matching by
+    # prepending a slash to non-flag args that lack one — mirroring the `^/?`
+    # already used for `repos/` paths. (repos/ paths never reach here; they're
+    # resolved earlier via TARGET_REPO. The owner allowlist below is unchanged,
+    # so this loosens the path FORM, never the owner check.)
     case "$a" in
+      -*|/*) ap="$a" ;;
+      *)     ap="/$a" ;;
+    esac
+    case "$ap" in
       /user|/users/*|/search/*|/rate_limit|/meta|/octocat|/zen|/emojis|/licenses|/licenses/*|/gitignore|/gitignore/*|/app|/app/*|/installation|/installation/*|/markdown|/markdown/*|/feeds|/notifications|/notifications/*)
         exec "$REAL_GH" "$@"
         ;;
     esac
     if [ "${#ALLOWED_OWNERS[@]}" -gt 0 ]; then
       for owner in "${ALLOWED_OWNERS[@]}"; do
-        if [ "$a" = "/orgs/$owner" ] || [[ "$a" == /orgs/"$owner"/* ]]; then
+        if [ "$ap" = "/orgs/$owner" ] || [[ "$ap" == /orgs/"$owner"/* ]]; then
           exec "$REAL_GH" "$@"
         fi
       done
     fi
   done
   # `gh api` against an unrecognized path with no /repos/ prefix → refuse.
-  deny "" "gh api path did not match any allowed pattern; pass /repos/<allowed-owner>/<name>/... or a meta path (/user, /orgs/<allowed>/...)"
+  deny "" "gh api path did not match any allowed pattern; pass /repos/<allowed-owner>/<name>/... or a meta path (/user, /orgs/<allowed>/... — leading slash optional)"
 fi
 
 # Couldn't determine target, not a pass-through subcommand → refuse, suggest --repo.

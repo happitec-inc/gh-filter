@@ -145,6 +145,8 @@ These don't reference a repo and are allowed regardless of allowlist:
 
 `/orgs/<owner>` and `/orgs/<owner>/*` are allowed only when `<owner>` appears in the configured allowlist.
 
+The leading slash is optional on all of these — `gh api` treats `orgs/<owner>` and `/orgs/<owner>` identically, and the filter accepts both forms (matching the `repos/` handling). The owner allowlist is unaffected either way.
+
 ## Uninstallation
 
 ```bash

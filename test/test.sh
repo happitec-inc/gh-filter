@@ -122,6 +122,15 @@ echo ""
 echo "=== Allow: meta api paths ==="
 assert_allow "api /user"                    api /user
 assert_allow "api /orgs/test-allowed-org"   api /orgs/test-allowed-org
+# #220: meta/orgs paths must also be accepted WITHOUT a leading slash
+# (gh api treats `orgs/OWNER` == `/orgs/OWNER`). The owner allowlist is unchanged.
+assert_allow "api user (no slash)"                         api user
+assert_allow "api licenses/mit (no slash)"                 api licenses/mit
+assert_allow "api orgs/test-allowed-org (no slash)"        api orgs/test-allowed-org
+assert_allow "api orgs/test-allowed-org/repos (no slash)"  api orgs/test-allowed-org/repos
+# security regression: a disallowed org must still block, slash or no slash
+assert_block "api orgs/disallowed (no slash) blocked"      api orgs/disallowed-test-owner/repos
+assert_block "api /orgs/disallowed blocked"                api /orgs/disallowed-test-owner/repos
 
 echo ""
 echo "=== Git-remote fallback ==="
