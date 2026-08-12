@@ -344,7 +344,17 @@ done
 # call against an allowlisted owner. The owner is gated identically to the repo
 # case; this widens the FORMS we can recognise, never the set of allowed owners.
 TARGET_ORG=""
-if [ "$SUBCMD" != "api" ]; then
+# `--org` only names the TARGET for subcommands that operate on an org. For
+# `gh repo fork --org X` it names the fork DESTINATION while the write lands on
+# the foreign upstream, so treating it as the target would let
+# `repo fork <foreign>/x --org <allowed>` through. `gh repo read-file` uses -o
+# for --output, which would swallow a filename as an org and false-block.
+# Allowlist the subcommands where --org genuinely is the target.
+case "$SUBCMD" in
+  secret|variable|ruleset|codespace|attestation) ORG_SUBCMD=1 ;;
+  *) ORG_SUBCMD=0 ;;
+esac
+if [ "$ORG_SUBCMD" = "1" ]; then
 i=0
 args=("$@")
 while [ $i -lt ${#args[@]} ]; do
@@ -431,7 +441,7 @@ fi
 # checked an owner the call never touches, letting
 # `-R <allowed>/x -o <foreign>` through. Whenever both are present, the ORG is
 # the real target, so it wins.
-if [ -n "$TARGET_ORG" ] && [ -n "$TARGET_REPO" ]; then
+if [ "$ORG_SUBCMD" = "1" ] && [ -n "$TARGET_ORG" ] && [ -n "$TARGET_REPO" ]; then
   TARGET_REPO=""
 fi
 
