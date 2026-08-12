@@ -330,6 +330,32 @@ while [ $i -lt ${#args[@]} ]; do
   i=$((i+1))
 done
 
+# 1b. `--org OWNER` / `--org=OWNER`. Some subcommands (`gh secret set`,
+# `gh variable set`, `gh ruleset`) target an ORG rather than a repo, so there is
+# no OWNER/NAME to parse and detection below would fall through to a deny that
+# reads as "could not determine target" — a false block on a perfectly legal
+# call against an allowlisted owner. The owner is gated identically to the repo
+# case; this widens the FORMS we can recognise, never the set of allowed owners.
+TARGET_ORG=""
+i=0
+args=("$@")
+while [ $i -lt ${#args[@]} ]; do
+  a="${args[$i]}"
+  case "$a" in
+    --org|-o)
+      if [ $((i+1)) -lt ${#args[@]} ]; then
+        TARGET_ORG="${args[$((i+1))]}"
+      fi
+      break
+      ;;
+    --org=*)
+      TARGET_ORG="${a#--org=}"
+      break
+      ;;
+  esac
+  i=$((i+1))
+done
+
 # 2. `gh api`: extract /repos/OWNER/NAME from a path arg.
 if [ -z "$TARGET_REPO" ] && [ "$SUBCMD" = "api" ]; then
   for a in "$@"; do
@@ -359,7 +385,10 @@ fi
 # because there the API path itself (or the absence of one) is the source of
 # truth — meta-paths like `/user` should be evaluated against the api-block
 # rules below, not the cwd's remote.
-if [ -z "$TARGET_REPO" ] && [ "$SUBCMD" != "api" ]; then
+# An explicit --org beats an inferred remote: `gh secret set --org X` run from
+# inside some unrelated checkout must be gated on X, not on that checkout's
+# owner. Inferring the target from the cwd there is simply the wrong answer.
+if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SUBCMD" != "api" ]; then
   REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
   if [ -n "$REMOTE_URL" ]; then
     # Strip trailing /  and .git, then extract OWNER/NAME from the URL tail.
@@ -385,6 +414,17 @@ if [ -n "$TARGET_REPO" ]; then
     exec "$REAL_GH" "$@"
   fi
   deny "$TARGET_REPO" "owner '$OWNER' is not in the allowed list"
+fi
+
+# Org-targeted call (no repo). Same allowlist, same deny path.
+if [ -n "$TARGET_ORG" ]; then
+  if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
+    deny "$TARGET_ORG" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
+  fi
+  if is_allowed_owner "$TARGET_ORG"; then
+    exec "$REAL_GH" "$@"
+  fi
+  deny "$TARGET_ORG" "org '$TARGET_ORG' is not in the allowed list"
 fi
 
 # No target detected. If this is a `gh api` call to a non-repo path, allow it
