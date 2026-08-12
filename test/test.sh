@@ -91,6 +91,22 @@ echo "=== Block: third-party via api path ==="
 assert_allow "secret list --org allowed"         secret list --org test-allowed-org
 assert_allow "secret list --org=allowed"         secret list --org=test-allowed-org
 assert_allow "variable list --org allowed"       variable list --org test-allowed-org
+# Attached shorthand. gh accepts `-oORG` and `-o=ORG` and routes them to the
+# org; recognising only `-o ORG` left the target unset, so the cwd-remote
+# fallback decided the verdict and a foreign org passed through from any
+# allowlisted checkout. Same gap existed for `-R`.
+assert_allow "secret list -oallowed (attached)"   secret list -otest-allowed-org
+assert_allow "secret list -o=allowed"             secret list -o=test-allowed-org
+assert_block "secret list -odisallowed (attached)" secret list -odisallowed-test-owner
+assert_block "secret list -o=disallowed"          secret list -o=disallowed-test-owner
+assert_block "issue list -Rdisallowed (attached)"  issue list -Rdisallowed-test-owner/test-repo
+
+# --repo and --org are not mutually exclusive for secret/variable: gh ignores
+# --repo and hits the org. The org must therefore decide the verdict, or an
+# allowlisted repo launders a foreign org's call.
+assert_block "secret list -R allowed/x -o disallowed" secret list -R test-allowed-org/x -o disallowed-test-owner
+assert_allow "secret list -R disallowed/x -o allowed" secret list -R disallowed-test-owner/x -o test-allowed-org
+
 assert_block "secret list --org disallowed"      secret list --org disallowed-test-owner
 assert_block "secret list --org=disallowed"      secret list --org=disallowed-test-owner
 assert_block "variable list --org disallowed"    variable list --org disallowed-test-owner
