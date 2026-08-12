@@ -83,6 +83,18 @@ assert_block "pr create --repo disallowed/X"     pr create --repo disallowed-tes
 
 echo ""
 echo "=== Block: third-party via api path ==="
+# --- org-targeted subcommands (--org OWNER, no repo to parse) ---------------
+# `gh secret set --org X`, `gh variable set --org X`, `gh ruleset ... --org X`
+# have no OWNER/NAME anywhere in argv. Before these were recognised, every such
+# call fell through to the generic "could not determine target" deny — a false
+# block on a legal call against an allowlisted owner.
+assert_allow "secret list --org allowed"         secret list --org test-allowed-org
+assert_allow "secret list --org=allowed"         secret list --org=test-allowed-org
+assert_allow "variable list --org allowed"       variable list --org test-allowed-org
+assert_block "secret list --org disallowed"      secret list --org disallowed-test-owner
+assert_block "secret list --org=disallowed"      secret list --org=disallowed-test-owner
+assert_block "variable list --org disallowed"    variable list --org disallowed-test-owner
+
 assert_block "api /repos/disallowed/X"            api /repos/disallowed-test-owner/test-repo
 assert_block "api repos/disallowed/X (no slash)"  api repos/disallowed-test-owner/test-repo/issues
 assert_block "api -X POST /repos/disallowed/X"    api -X POST /repos/disallowed-test-owner/test-repo/issues
