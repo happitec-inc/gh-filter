@@ -91,6 +91,12 @@ echo "=== Block: third-party via api path ==="
 assert_allow "secret list --org allowed"         secret list --org test-allowed-org
 assert_allow "secret list --org=allowed"         secret list --org=test-allowed-org
 assert_allow "variable list --org allowed"       variable list --org test-allowed-org
+# --org only names the TARGET for org-operating subcommands. `gh repo fork --org X`
+# names the fork DESTINATION while the write lands on the foreign upstream, and
+# `gh repo read-file -o` is --output. Scoping is what keeps both honest.
+assert_block "repo fork foreign/x --org allowed"  repo fork disallowed-test-owner/repo --org test-allowed-org
+assert_allow "repo read-file -o out.txt -R allowed/x" repo read-file -o out.txt -R test-allowed-org/x README.md
+
 # Attached shorthand. gh accepts `-oORG` and `-o=ORG` and routes them to the
 # org; recognising only `-o ORG` left the target unset, so the cwd-remote
 # fallback decided the verdict and a foreign org passed through from any
