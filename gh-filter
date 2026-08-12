@@ -326,6 +326,13 @@ while [ $i -lt ${#args[@]} ]; do
       TARGET_REPO="${a#-R=}"
       break
       ;;
+    # Attached shorthand: `gh issue list -Rowner/name`. gh accepts it; missing it
+    # here left TARGET_REPO empty and the call fell through to the cwd-remote
+    # fallback, i.e. gated on the WRONG owner.
+    -R?*)
+      TARGET_REPO="${a#-R}"
+      break
+      ;;
   esac
   i=$((i+1))
 done
@@ -337,6 +344,7 @@ done
 # call against an allowlisted owner. The owner is gated identically to the repo
 # case; this widens the FORMS we can recognise, never the set of allowed owners.
 TARGET_ORG=""
+if [ "$SUBCMD" != "api" ]; then
 i=0
 args=("$@")
 while [ $i -lt ${#args[@]} ]; do
@@ -352,9 +360,22 @@ while [ $i -lt ${#args[@]} ]; do
       TARGET_ORG="${a#--org=}"
       break
       ;;
+    # Attached and =-joined shorthand: `-oORG`, `-o=ORG`. gh accepts both and
+    # routes them to the org. Recognising only the space-separated form left
+    # TARGET_ORG empty, so the cwd-remote fallback decided the verdict — from
+    # any allowlisted checkout that passed a FOREIGN org's call straight through.
+    -o=*)
+      TARGET_ORG="${a#-o=}"
+      break
+      ;;
+    -o?*)
+      TARGET_ORG="${a#-o}"
+      break
+      ;;
   esac
   i=$((i+1))
 done
+fi
 
 # 2. `gh api`: extract /repos/OWNER/NAME from a path arg.
 if [ -z "$TARGET_REPO" ] && [ "$SUBCMD" = "api" ]; then
@@ -404,6 +425,15 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SUBCMD" != "api" ]; then
 fi
 
 # ---- Allowlist gate ---------------------------------------------------------
+
+# `--repo` and `--org` are NOT mutually exclusive for `secret`/`variable`: gh
+# ignores --repo and hits the org endpoint. Gating on the repo first therefore
+# checked an owner the call never touches, letting
+# `-R <allowed>/x -o <foreign>` through. Whenever both are present, the ORG is
+# the real target, so it wins.
+if [ -n "$TARGET_ORG" ] && [ -n "$TARGET_REPO" ]; then
+  TARGET_REPO=""
+fi
 
 if [ -n "$TARGET_REPO" ]; then
   OWNER="${TARGET_REPO%%/*}"
