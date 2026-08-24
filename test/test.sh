@@ -94,6 +94,39 @@ assert_in_allowlisted_checkout() {
   fi
 }
 
+# The mirror of the helper above, from a checkout whose remote is NOT
+# allowlisted. This dimension did not exist until now, and its absence is what
+# let a fail-open ship: extra owners were folded into the target, which
+# suppressed the cwd fallback, so `issue develop --branch-repo <allowed>/x`
+# went ALLOW from a foreign checkout — while all 43 allowlisted-checkout
+# assertions stayed green. Reintroducing that defect surgically left the suite
+# at 127/127.
+#
+# The distinction these assertions exist to hold: naming an ALLOWLISTED owner
+# in a flag must not license the call when the repo it would also act on is
+# foreign. Both must pass.
+assert_in_foreign_checkout() {
+  local label="$1"; shift
+  local expected="$1"; shift
+  local tmp; tmp=$(/usr/bin/mktemp -d)
+  (
+    cd "$tmp"
+    /usr/bin/git init -q
+    /usr/bin/git remote add origin git@github.com:disallowed-test-owner/test-repo.git
+    "$FILTER" "$@" >/dev/null 2>&1
+  )
+  local ec=$?
+  /bin/rm -rf "$tmp"
+  if [ "$expected" = "block" ] && [ "$ec" = "77" ]; then
+    PASS=$((PASS+1)); echo "PASS: $label (blocked from foreign checkout)"
+  elif [ "$expected" = "allow" ] && [ "$ec" != "77" ]; then
+    PASS=$((PASS+1)); echo "PASS: $label (passed through, gh exit $ec)"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: $label  (expected $expected, exit $ec)"
+    echo "       cmd: gh $*"
+  fi
+}
+
 assert_block() {
   local label="$1"; shift
   assert_exit "$label" 77 "$@"
@@ -298,6 +331,17 @@ assert_in_allowlisted_checkout "repo fork allowed/x --org disallowed"      block
 # nothing. The long form above is the real case.
 assert_in_allowlisted_checkout "repo fork disallowed/x --org allowed"      block repo fork disallowed-test-owner/x --org test-allowed-org
 assert_in_allowlisted_checkout "repo fork allowed/x --org allowed"         allow repo fork test-allowed-org/x --org test-allowed-org
+
+# --- Foreign checkout: an allowlisted FLAG owner must not license a foreign
+# --- cwd repo. These are the assertions that can see a fifth fail-open on the
+# --- extra-owner path; without them the suite reported 127/127 with the
+# --- round-12 Critical surgically reintroduced.
+assert_in_foreign_checkout "branch-repo allowed, cwd foreign"   block issue develop 1 --branch-repo test-allowed-org/x
+assert_in_foreign_checkout "branch-repo foreign, cwd foreign"   block issue develop 1 --branch-repo disallowed-test-owner/x
+assert_in_foreign_checkout "fork --org allowed, cwd foreign"    block repo fork --org test-allowed-org
+assert_in_foreign_checkout "fork allowed/x --org allowed, cwd foreign" allow repo fork test-allowed-org/x --org test-allowed-org
+assert_in_foreign_checkout "issue list, cwd foreign"            block issue list
+assert_in_foreign_checkout "secret list --org allowed, cwd foreign" allow secret list --org test-allowed-org
 # The previous version of this used --repo, which sets TARGET_REPO and
 # short-circuits the guard — so it passed with the guard scoped OR un-scoped.
 # Measured: un-scoping the guard CLI-wide left the suite at 117/117. Running it
