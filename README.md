@@ -135,6 +135,18 @@ gh search issues --project some-other-org/5             # BLOCKED (owner/number 
 gh issue list --repo your-org/x --project "Some Board"  # allowed — --project outside `search` is a NAME, not an owner
 ```
 
+Targeting is not always spelled "owner". These are gated too:
+
+```bash
+gh issue develop 1 --branch-repo some-other-org/x     # BLOCKED — the branch is created in THAT repo
+gh issue develop 1 --branch-repo just-a-name          # allowed — a bare name is under the current owner
+gh search issues --team-mentions some-other-org/eng   # BLOCKED
+gh repo fork your-org/x --org some-other-org          # BLOCKED — the fork is WRITTEN into --org
+gh repo fork some-other-org/x --org your-org          # BLOCKED — foreign upstream
+```
+
+**Every owner named anywhere in an invocation must pass.** A gated repo does not license a second owner named by another flag: that is why `repo fork <allowed>/x --org <foreign>` blocks even though its positional argument is allowlisted.
+
 `repo` is deliberately **excluded**. Two reasons, both load-bearing:
 
 - On `gh repo fork --org X`, `--org` names the fork *destination* while the write lands on the foreign upstream. Treating it as the target would let `gh repo fork some-other-org/thing --org your-org` through.

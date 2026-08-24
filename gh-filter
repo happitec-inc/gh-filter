@@ -187,6 +187,23 @@ team_owner() {
   esac
 }
 
+# Owner out of a repo reference. `gh issue develop --branch-repo` accepts
+# "Name or URL", so all three shapes reach the same field:
+#   NAME              -> no owner (the current repo)
+#   OWNER/NAME        -> OWNER
+#   https://host/O/N  -> O
+repo_ref_owner() {
+  local v="$1"
+  v="${v#*://}"                      # strip scheme
+  case "$v" in
+    *.*/*/*) v="${v#*/}" ;;          # host/OWNER/NAME -> OWNER/NAME
+  esac
+  case "$v" in
+    */*) echo "${v%%/*}" ;;
+    *)   echo "" ;;
+  esac
+}
+
 # Gate a target value that may be a COMMA-SEPARATED LIST.
 #
 # `gh search`'s --owner and --repo are `strings` flags, so `<a>,<b>` is one
@@ -551,7 +568,7 @@ if [ "$ORG_SUBCMD" = "1" ]; then
           elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
         fi
         ;;
-      # `--repo-owner` is the codespace tree's owner target (13 subcommands).
+      # `--repo-owner` is the codespace tree's owner target (11 subcommands).
       # It contains "owner", so a name-based flag sweep would have found it —
       # the earlier miss was that the sweep never left the `project` tree.
       --repo-owner)
@@ -617,14 +634,67 @@ if [ "$ORG_SUBCMD" = "1" ]; then
     esac
     i=$((i+1))
   done
-  # An explicit owner named by --source-owner/--target-owner outranks nothing
-  # else here (project copy has no other owner flag), but if BOTH a plain
-  # --owner and a copy owner somehow appear, every named owner still has to
-  # pass — so join rather than choose.
-  if [ -n "$EXTRA_OWNERS" ]; then
-    TARGET_ORG="${TARGET_ORG:+$TARGET_ORG,}$EXTRA_OWNERS"
-    SELF_TARGET=0
-  fi
+fi
+
+# A second, subcommand-independent pass for target flags that live outside the
+# org-subcommand set. Each was measured reaching the real binary from an
+# allowlisted checkout before it was added here.
+i=0
+args2=("$@")
+while [ $i -lt ${#args2[@]} ]; do
+  a="${args2[$i]}"
+  case "$a" in
+    --) break ;;
+    # `gh issue develop --branch-repo <Name|OWNER/NAME|URL>` creates the branch
+    # in THAT repo — gh's own documented example uses a different repo.
+    --branch-repo)
+      if [ $((i+1)) -lt ${#args2[@]} ]; then
+        v=$(repo_ref_owner "${args2[$((i+1))]}")
+        [ -n "$v" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+      fi
+      ;;
+    --branch-repo=*)
+      v=$(repo_ref_owner "${a#--branch-repo=}")
+      [ -n "$v" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+      ;;
+    # `gh search --team-mentions OWNER/TEAM` names an owner the same way
+    # --team does.
+    --team-mentions)
+      if [ $((i+1)) -lt ${#args2[@]} ]; then
+        v=$(team_owner "${args2[$((i+1))]}")
+        [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+      fi
+      ;;
+    --team-mentions=*)
+      v=$(team_owner "${a#--team-mentions=}")
+      [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+      ;;
+    # `gh repo fork <upstream> --org X` WRITES the fork into X. Round 2
+    # established that treating --org as THE target would let
+    # `repo fork <foreign>/x --org <allowed>` through, so `repo` stays out of
+    # the org-subcommand list — but the destination is still a write target.
+    # Gating it as an ADDITIONAL owner keeps both ends checked.
+    --org|-o|--org=*|-o=*)
+      if [ "$SUBCMD" = "repo" ] && [ "${2:-}" = "fork" ]; then
+        case "$a" in
+          --org|-o) if [ $((i+1)) -lt ${#args2[@]} ]; then v="${args2[$((i+1))]}"; else v=""; fi ;;
+          *)        v="${a#*=}" ;;
+        esac
+        [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+      fi
+      ;;
+  esac
+  i=$((i+1))
+done
+
+# Fold every additionally-named owner into the org target — AFTER BOTH scans.
+# Folding after the first scan only meant a flag parsed by the SECOND scan
+# never reached the gate, so the guard refused it instead. Measured as three
+# false blocks: `issue develop --branch-repo <allowed>/x`, the same with a
+# bare branch-repo name, and `search --team-mentions <allowed>/eng`.
+if [ -n "$EXTRA_OWNERS" ]; then
+  TARGET_ORG="${TARGET_ORG:+$TARGET_ORG,}$EXTRA_OWNERS"
+  SELF_TARGET=0
 fi
 
 # 2. `gh api`: extract /repos/OWNER/NAME from a path arg.
@@ -702,6 +772,11 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; t
           deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         fi
         ;;
+      # `--branch-repo` and `--team-mentions` are NOT listed: the second scan
+      # parses them unconditionally, so they are never "unparsed". Guarding a
+      # flag we do parse turns a legitimately owner-less value into a block —
+      # measured: `issue develop --branch-repo <bare-name>`, which names a repo
+      # under the CURRENT owner, was refused.
       --org|--org=*|--owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|--team|--team=*|--repo-owner|--repo-owner=*|-R|-R=*|-R?*|--repo|--repo=*)
         deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         ;;
@@ -744,10 +819,18 @@ if [ -n "$TARGET_REPO" ]; then
   # it takes a list too. Comparing the raw string let
   # `search code --repo <allowed>/x,<foreign>/y` through while the same call
   # without the comma blocked.
-  if DENY_REASON=$(all_elements_allowed "$TARGET_REPO" repo); then
-    exec "$REAL_GH" "$@"
+  if ! DENY_REASON=$(all_elements_allowed "$TARGET_REPO" repo); then
+    deny "$TARGET_REPO" "$DENY_REASON"
   fi
-  deny "$TARGET_REPO" "$DENY_REASON"
+  # A repo target does not license every OTHER owner named in the same call —
+  # `repo fork <allowed>/x --org <foreign>` writes the fork INTO the foreign
+  # org while the positional passes. Every named owner is checked.
+  if [ -n "$EXTRA_OWNERS" ]; then
+    if ! DENY_REASON=$(all_elements_allowed "$EXTRA_OWNERS" org); then
+      deny "$EXTRA_OWNERS" "$DENY_REASON"
+    fi
+  fi
+  exec "$REAL_GH" "$@"
 fi
 
 # Org-targeted call (no repo). Same allowlist, same deny path.
