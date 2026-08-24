@@ -260,7 +260,7 @@ assert_in_allowlisted_checkout "issue create -Ttemplate"     allow issue create 
 # owner; the owner comes from --owner.
 assert_in_allowlisted_checkout "project link --team NAME (no slash)" allow project link 1 --owner test-allowed-org --team my_team
 
-# `codespace --repo-owner` targets an owner on 13 subcommands. It contains
+# `codespace --repo-owner` targets an owner on 11 subcommands. It contains
 # "owner", so a name-based flag sweep would have caught it — the earlier miss
 # was that the sweep never left the `project` tree.
 assert_in_allowlisted_checkout "codespace --repo-owner disallowed"  block codespace delete --repo-owner disallowed-test-owner --all
@@ -273,7 +273,34 @@ assert_in_allowlisted_checkout "codespace --repo-owner allowed"     allow codesp
 assert_in_allowlisted_checkout "search --project disallowed/N"      block search issues --project disallowed-test-owner/5
 assert_in_allowlisted_checkout "search --project=disallowed/N"      block search prs --project=disallowed-test-owner/5
 assert_in_allowlisted_checkout "search --project allowed/N"         allow search issues --project test-allowed-org/5
-assert_allow "issue list --project NAME (not an owner)"             issue list --repo test-allowed-org/x --project "Some Board"
+
+# `gh issue develop --branch-repo <Name|OWNER/NAME|URL>` creates the branch in
+# THAT repo. All three value shapes reach the same field.
+assert_in_allowlisted_checkout "issue develop --branch-repo disallowed/x"  block issue develop 1 --branch-repo disallowed-test-owner/x
+assert_in_allowlisted_checkout "issue develop --branch-repo=disallowed/x"  block issue develop 1 --branch-repo=disallowed-test-owner/x
+assert_in_allowlisted_checkout "issue develop --branch-repo URL"           block issue develop 1 --branch-repo https://github.com/disallowed-test-owner/x
+assert_in_allowlisted_checkout "issue develop --branch-repo allowed/x"     allow issue develop 1 --branch-repo test-allowed-org/x
+# A BARE name resolves under the current owner and names no owner of its own.
+# Guarding a flag we already parse turned this into a block; that is why
+# --branch-repo is deliberately absent from the guard's flag list.
+assert_in_allowlisted_checkout "issue develop --branch-repo bare-name"     allow issue develop 1 --branch-repo just-a-name
+
+# `gh search --team-mentions OWNER/TEAM` names an owner exactly as --team does.
+assert_in_allowlisted_checkout "search --team-mentions disallowed/x"       block search issues --team-mentions disallowed-test-owner/eng
+assert_in_allowlisted_checkout "search --team-mentions allowed/x"          allow search issues --team-mentions test-allowed-org/eng
+
+# `gh repo fork <upstream> --org X` WRITES the fork into X. Both ends are
+# gated: an allowlisted upstream does not license a foreign destination, and
+# round 2's closure (foreign upstream, allowlisted destination) must survive.
+assert_in_allowlisted_checkout "repo fork allowed/x --org disallowed"      block repo fork test-allowed-org/x --org disallowed-test-owner
+assert_in_allowlisted_checkout "repo fork allowed/x -o disallowed"         block repo fork test-allowed-org/x -o disallowed-test-owner
+assert_in_allowlisted_checkout "repo fork disallowed/x --org allowed"      block repo fork disallowed-test-owner/x --org test-allowed-org
+assert_in_allowlisted_checkout "repo fork allowed/x --org allowed"         allow repo fork test-allowed-org/x --org test-allowed-org
+# The previous version of this used --repo, which sets TARGET_REPO and
+# short-circuits the guard — so it passed with the guard scoped OR un-scoped.
+# Measured: un-scoping the guard CLI-wide left the suite at 117/117. Running it
+# from an allowlisted checkout with no --repo is what makes it discriminate.
+assert_in_allowlisted_checkout "issue list --project NAME (not an owner)" allow issue list --project "Some Board"
 
 # --- `search` / `skill search`: --owner is a `strings` (list) flag ----------
 # Receipt: `gh search repos --help` gives `--owner strings   Filter on owner`,
