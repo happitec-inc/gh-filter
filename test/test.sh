@@ -212,12 +212,37 @@ assert_allow "project list --owner @me"           project list --owner @me
 # cwd remote. Both are real targets; every named owner must pass. These run
 # from an allowlisted checkout because that is the only configuration in which
 # the laundering reproduces.
+#
+# Negative control for this block, so the claim is reproducible: strip the
+# `--source-owner|--target-owner` arms from the parse loop AND their entries in
+# the guard's flag list, and the four BLOCK cases go red at exit 0 (they reach
+# the binary). Strip the parse arms ALONE and the two ALLOW cases go red at 77
+# instead — those are the assertions that isolate the parse arms from the
+# guard, which is why both halves are kept.
 assert_in_allowlisted_checkout "project copy --target-owner disallowed"  block project copy 1 --target-owner disallowed-test-owner
 assert_in_allowlisted_checkout "project copy --source-owner disallowed"  block project copy 1 --source-owner disallowed-test-owner
 assert_in_allowlisted_checkout "project copy --target-owner=disallowed"  block project copy 1 --target-owner=disallowed-test-owner
 assert_in_allowlisted_checkout "project copy allowed->disallowed"        block project copy 1 --source-owner test-allowed-org --target-owner disallowed-test-owner
 assert_in_allowlisted_checkout "project copy allowed->allowed"           allow project copy 1 --source-owner test-allowed-org --target-owner test-allowed-org
 assert_in_allowlisted_checkout "project copy --target-owner @me"         allow project copy 1 --target-owner @me
+
+# `gh project link|unlink` take `-T, --team [HOST/]OWNER/TEAM`, and the team's
+# OWNER sets the project owner. Unparsed, every spelling reached the binary
+# from an allowlisted checkout while `--repo` on the same subcommand blocked —
+# which is what proved it was the flag and not the fallback. The owner is the
+# component before the last, in both the OWNER/TEAM and HOST/OWNER/TEAM forms.
+assert_in_allowlisted_checkout "project link --team disallowed/x"    block project link 1 --team disallowed-test-owner/eng
+assert_in_allowlisted_checkout "project link -T disallowed/x"        block project link 1 -T disallowed-test-owner/eng
+assert_in_allowlisted_checkout "project link --team=disallowed/x"    block project link 1 --team=disallowed-test-owner/eng
+assert_in_allowlisted_checkout "project link -Tdisallowed/x"         block project link 1 -Tdisallowed-test-owner/eng
+assert_in_allowlisted_checkout "project unlink --team disallowed/x"  block project unlink 1 --team disallowed-test-owner/eng
+assert_in_allowlisted_checkout "project link --team HOST/disallowed/x" block project link 1 --team github.com/disallowed-test-owner/eng
+# Every named owner is gated, so an allowlisted --owner cannot shield a foreign
+# team — this is the case a per-flag "first target wins" parser would miss.
+assert_in_allowlisted_checkout "project link --owner allowed --team disallowed/x" block project link 1 --owner test-allowed-org --team disallowed-test-owner/eng
+assert_in_allowlisted_checkout "project link --team allowed/x"       allow project link 1 --team test-allowed-org/eng
+assert_in_allowlisted_checkout "project link --team HOST/allowed/x"  allow project link 1 --team github.com/test-allowed-org/eng
+assert_in_allowlisted_checkout "project link --team @me"             allow project link 1 --team @me
 
 # --- `search` / `skill search`: --owner is a `strings` (list) flag ----------
 # Receipt: `gh search repos --help` gives `--owner strings   Filter on owner`,

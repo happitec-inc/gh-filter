@@ -115,6 +115,15 @@ gh project copy 1 --source-owner your-org --target-owner another-org      # allo
 gh project copy 1 --source-owner your-org --target-owner some-other-org   # BLOCKED on the target
 ```
 
+`link` and `unlink` add a second targeting flag: `-T, --team [HOST/]OWNER/TEAM`, whose **owner sets the project owner**. The owner is extracted from either form and gated, and an allowlisted `--owner` does not shield a foreign team — every owner named in the invocation must pass:
+
+```bash
+gh project link 1 --team your-org/eng                             # allowed
+gh project link 1 --team github.com/your-org/eng                  # allowed (host-prefixed form)
+gh project link 1 --team some-other-org/eng                       # BLOCKED
+gh project link 1 --owner your-org --team some-other-org/eng      # BLOCKED on the team's owner
+```
+
 `repo` is deliberately **excluded**. Two reasons, both load-bearing:
 
 - On `gh repo fork --org X`, `--org` names the fork *destination* while the write lands on the foreign upstream. Treating it as the target would let `gh repo fork some-other-org/thing --org your-org` through.
