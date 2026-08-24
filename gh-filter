@@ -243,7 +243,7 @@ all_elements_allowed() {
     seen=$((seen+1))
   done
   if [ "$seen" -eq 0 ]; then
-    echo "no allowed owner parsed from '$raw'"
+    echo "no owner parsed from '$raw' (every element was empty)"
     return 1
   fi
   return 0
@@ -441,9 +441,11 @@ TARGET_ORG=""
 # Allowlist the subcommands where --org genuinely is the target.
 # `project` belongs here too, and its absence was a hole rather than a nuance:
 # ALL 19 `gh project` subcommands take `--owner`, it is the only owner-targeting
-# flag any of them has, and 14 of the 19 are authenticated MUTATIONS
-# (item-add, item-create, item-edit, item-archive, item-delete, delete, edit,
-# field-create, field-delete, close, copy, link, unlink, mark-template). With `project` absent, `--owner` went unparsed,
+# flag any of them has, and 15 of the 19 are authenticated MUTATIONS: close,
+# copy, create, delete, edit, field-create, field-delete, item-add,
+# item-archive, item-create, item-delete, item-edit, link, mark-template,
+# unlink. The other four — field-list, item-list, list, view — are reads. An
+# enumeration invites checking, so it should be checkable: 15 + 4 = 19. With `project` absent, `--owner` went unparsed,
 # detection found nothing, and the cwd-remote fallback gated the call on the
 # local checkout's owner — so `project delete 1 --owner <foreign>` ran from any
 # allowlisted checkout reached the real binary. There is no `-o` shorthand
