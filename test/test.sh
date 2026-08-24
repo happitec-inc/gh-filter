@@ -242,7 +242,38 @@ assert_in_allowlisted_checkout "project link --team HOST/disallowed/x" block pro
 assert_in_allowlisted_checkout "project link --owner allowed --team disallowed/x" block project link 1 --owner test-allowed-org --team disallowed-test-owner/eng
 assert_in_allowlisted_checkout "project link --team allowed/x"       allow project link 1 --team test-allowed-org/eng
 assert_in_allowlisted_checkout "project link --team HOST/allowed/x"  allow project link 1 --team github.com/test-allowed-org/eng
-assert_in_allowlisted_checkout "project link --team @me"             allow project link 1 --team @me
+# `@me` is documented for --owner, NOT for --team, whose value is
+# `[HOST/]OWNER/TEAM`. `--team @me` is not a form gh accepts, so the filter
+# refusing it is the correct fail-closed answer — this assertion previously
+# said `allow` because it was written before the no-slash rule, and the
+# no-slash rule is what makes it wrong.
+assert_in_allowlisted_checkout "project link --team @me (not a valid form)" block project link 1 --team @me
+
+# `-T` is `--template` on issue/pr create. Guarding it CLI-wide false-blocked
+# those — a regression this branch introduced and this pair now guards.
+assert_in_allowlisted_checkout "issue create -T template"    allow issue create -T bug.md --title x --body y
+assert_in_allowlisted_checkout "pr create -T template"       allow pr create -T pr.md --title x --body y
+assert_in_allowlisted_checkout "issue create -Ttemplate"     allow issue create -Tbug.md --title x --body y
+
+# gh reads an owner out of --team only when the value contains a slash
+# (link.go). `--team my_team` is gh's own documented example and names no
+# owner; the owner comes from --owner.
+assert_in_allowlisted_checkout "project link --team NAME (no slash)" allow project link 1 --owner test-allowed-org --team my_team
+
+# `codespace --repo-owner` targets an owner on 13 subcommands. It contains
+# "owner", so a name-based flag sweep would have caught it — the earlier miss
+# was that the sweep never left the `project` tree.
+assert_in_allowlisted_checkout "codespace --repo-owner disallowed"  block codespace delete --repo-owner disallowed-test-owner --all
+assert_in_allowlisted_checkout "codespace --repo-owner=disallowed"  block codespace ssh --repo-owner=disallowed-test-owner
+assert_in_allowlisted_checkout "codespace --repo-owner allowed"     allow codespace delete --repo-owner test-allowed-org --all
+
+# `gh search issues|prs --project owner/number` names an owner. Only under
+# `search` — `--project` elsewhere is a project NAME, and gating it there would
+# be the third false-block class of this branch.
+assert_in_allowlisted_checkout "search --project disallowed/N"      block search issues --project disallowed-test-owner/5
+assert_in_allowlisted_checkout "search --project=disallowed/N"      block search prs --project=disallowed-test-owner/5
+assert_in_allowlisted_checkout "search --project allowed/N"         allow search issues --project test-allowed-org/5
+assert_allow "issue list --project NAME (not an owner)"             issue list --repo test-allowed-org/x --project "Some Board"
 
 # --- `search` / `skill search`: --owner is a `strings` (list) flag ----------
 # Receipt: `gh search repos --help` gives `--owner strings   Filter on owner`,

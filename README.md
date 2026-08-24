@@ -122,6 +122,17 @@ gh project link 1 --team your-org/eng                             # allowed
 gh project link 1 --team github.com/your-org/eng                  # allowed (host-prefixed form)
 gh project link 1 --team some-other-org/eng                       # BLOCKED
 gh project link 1 --owner your-org --team some-other-org/eng      # BLOCKED on the team's owner
+gh project link 1 --owner your-org --team my_team                 # allowed — no slash, so it names a team, not an owner
+```
+
+`-T` is the shorthand for `--team` **only under `project`**. On `gh issue create` and `gh pr create` it is `--template`, so it is read as a team nowhere else.
+
+Two more owner-targeting flags outside the `project` tree, both gated:
+
+```bash
+gh codespace delete --repo-owner some-other-org --all   # BLOCKED (13 codespace subcommands take it)
+gh search issues --project some-other-org/5             # BLOCKED (owner/number form)
+gh issue list --repo your-org/x --project "Some Board"  # allowed — --project outside `search` is a NAME, not an owner
 ```
 
 `repo` is deliberately **excluded**. Two reasons, both load-bearing:
