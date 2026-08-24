@@ -175,6 +175,11 @@ is_allowed_owner() {
 # `OWNER/TEAM` and `HOST/OWNER/TEAM` forms.
 team_owner() {
   local v="$1" rest
+  # gh only reads an owner out of --team when the value CONTAINS a slash
+  # (link.go: `strings.Contains(v, "/")`). `--team my_team` — gh's own
+  # documented example — names the team only, with the owner coming from
+  # --owner. Treating it as an owner false-blocked that call.
+  case "$v" in */*) ;; *) echo ""; return 0 ;; esac
   rest="${v%/*}"          # strip /TEAM
   case "$rest" in
     */*) echo "${rest##*/}" ;;   # HOST/OWNER -> OWNER
@@ -530,20 +535,61 @@ if [ "$ORG_SUBCMD" = "1" ]; then
       # reached the binary from an allowlisted checkout while the `--repo`
       # control on the same subcommand blocked — so it was the unparsed flag,
       # not the fallback.
-      --team|-T)
+      # `-T` is NOT unambiguous: it is `--template` on `issue create` and
+      # `pr create`. Guarding it CLI-wide false-blocked `gh issue create -T
+      # bug.md` — a regression this branch introduced. `-T` is read as a team
+      # only under `project`, the same way `-o` is read as an org only under an
+      # org subcommand. `--team` spelled in full is unambiguous CLI-wide.
+      -T|-T=*|-T?*)
+        if [ "$SUBCMD" = "project" ]; then
+          case "$a" in
+            -T)    if [ $((i+1)) -lt ${#args[@]} ]; then v=$(team_owner "${args[$((i+1))]}"); else v=""; fi ;;
+            -T=*)  v=$(team_owner "${a#-T=}") ;;
+            *)     v=$(team_owner "${a#-T}") ;;
+          esac
+          if [ "$v" = "@me" ]; then SELF_TARGET=1
+          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        fi
+        ;;
+      # `--repo-owner` is the codespace tree's owner target (13 subcommands).
+      # It contains "owner", so a name-based flag sweep would have found it —
+      # the earlier miss was that the sweep never left the `project` tree.
+      --repo-owner)
+        if [ $((i+1)) -lt ${#args[@]} ]; then
+          v="${args[$((i+1))]}"
+          if [ "$v" = "@me" ]; then SELF_TARGET=1
+          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        fi
+        ;;
+      --repo-owner=*)
+        v="${a#--repo-owner=}"
+        if [ "$v" = "@me" ]; then SELF_TARGET=1
+        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        ;;
+      # `gh search issues|prs --project owner/number` names an owner too. Only
+      # under `search`: `--project` elsewhere is a project NAME, not owner/N.
+      --project|--project=*)
+        if [ "$SUBCMD" = "search" ]; then
+          case "$a" in
+            --project) if [ $((i+1)) -lt ${#args[@]} ]; then v="${args[$((i+1))]}"; else v=""; fi ;;
+            *)         v="${a#--project=}" ;;
+          esac
+          case "$v" in
+            */*) v="${v%%/*}"
+                 if [ "$v" = "@me" ]; then SELF_TARGET=1
+                 elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi ;;
+          esac
+        fi
+        ;;
+      --team)
         if [ $((i+1)) -lt ${#args[@]} ]; then
           v=$(team_owner "${args[$((i+1))]}")
           if [ "$v" = "@me" ]; then SELF_TARGET=1
           elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
         fi
         ;;
-      --team=*|-T=*)
+      --team=*)
         v=$(team_owner "${a#*=}")
-        if [ "$v" = "@me" ]; then SELF_TARGET=1
-        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
-        ;;
-      -T?*)
-        v=$(team_owner "${a#-T}")
         if [ "$v" = "@me" ]; then SELF_TARGET=1
         elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
         ;;
@@ -639,12 +685,24 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; t
       # false-blocked `repo read-file -o out.txt` — the canonical use of that
       # command, and the very collision cited as the reason `repo` stays out of
       # ORG_SUBCMD. Guard `-o` only where it means an org.
+      # `-T` is `--template` on issue/pr create, so it is guarded only where it
+      # means a team; `--project` is a project NAME outside `search`.
+      -T|-T=*|-T?*)
+        if [ "$SUBCMD" = "project" ]; then
+          deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
+        fi
+        ;;
+      --project|--project=*)
+        if [ "$SUBCMD" = "search" ]; then
+          deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
+        fi
+        ;;
       -o|-o=*|-o?*)
         if [ "$ORG_SUBCMD" = "1" ]; then
           deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         fi
         ;;
-      --org|--org=*|--owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|--team|--team=*|-T|-T=*|-T?*|-R|-R=*|-R?*|--repo|--repo=*)
+      --org|--org=*|--owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|--team|--team=*|--repo-owner|--repo-owner=*|-R|-R=*|-R?*|--repo|--repo=*)
         deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         ;;
     esac
