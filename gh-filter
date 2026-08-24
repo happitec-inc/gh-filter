@@ -382,6 +382,23 @@ while [ $i -lt ${#args[@]} ]; do
       TARGET_ORG="${a#-o}"
       break
       ;;
+    # `--owner` is the long form on some org-targeting subcommands: `gh
+    # attestation verify --owner ORG` names the org whose artefacts are queried,
+    # and `-o` is its shorthand. Matching only `--org` left TARGET_ORG empty for
+    # the long form, so detection fell through to the cwd-remote fallback and
+    # `attestation verify --owner <foreign>` was ALLOWED from any allowlisted
+    # checkout while `-o <foreign>` blocked. Read-only, but the allowlist
+    # comment claimed a coverage the parser did not provide.
+    --owner)
+      if [ $((i+1)) -lt ${#args[@]} ]; then
+        TARGET_ORG="${args[$((i+1))]}"
+      fi
+      break
+      ;;
+    --owner=*)
+      TARGET_ORG="${a#--owner=}"
+      break
+      ;;
   esac
   i=$((i+1))
 done

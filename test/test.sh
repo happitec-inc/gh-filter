@@ -117,6 +117,18 @@ assert_block "secret list --org disallowed"      secret list --org disallowed-te
 assert_block "secret list --org=disallowed"      secret list --org=disallowed-test-owner
 assert_block "variable list --org disallowed"    variable list --org disallowed-test-owner
 
+# --- `--owner`, the long form of -o on org-targeting subcommands ------------
+# Receipt: `gh attestation verify --help` documents
+#   `-o, --owner string   GitHub organization to scope attestation lookup by`
+# so --owner names the TARGET here exactly as -o does. Before the parser
+# recognised it, TARGET_ORG stayed empty and detection fell through to the
+# cwd-remote fallback: `attestation verify --owner <foreign>` was ALLOWED from
+# any allowlisted checkout while `-o <foreign>` blocked.
+assert_allow "attestation verify --owner allowed"    attestation verify --owner test-allowed-org /nonexistent-subject
+assert_allow "attestation verify --owner=allowed"    attestation verify --owner=test-allowed-org /nonexistent-subject
+assert_block "attestation verify --owner disallowed" attestation verify --owner disallowed-test-owner /nonexistent-subject
+assert_block "attestation verify --owner=disallowed" attestation verify --owner=disallowed-test-owner /nonexistent-subject
+
 assert_block "api /repos/disallowed/X"            api /repos/disallowed-test-owner/test-repo
 assert_block "api repos/disallowed/X (no slash)"  api repos/disallowed-test-owner/test-repo/issues
 assert_block "api -X POST /repos/disallowed/X"    api -X POST /repos/disallowed-test-owner/test-repo/issues
@@ -133,18 +145,23 @@ assert_block "extension install"            extension install disallowed-test-ow
 # The "no target detectable" case must run from a directory with no git
 # remote, otherwise the filter's fallback would resolve a target and either
 # allow or block based on the remote's owner. Run from a tmp non-git dir.
-(
-  cd "$(/usr/bin/mktemp -d)"
-  "$FILTER" issue list >/dev/null 2>&1
-  ec=$?
-  if [ "$ec" = "77" ]; then
-    PASS=$((PASS+1))
-    echo "PASS: no target detectable (in tmp non-git dir) → blocked"
-  else
-    FAIL=$((FAIL+1))
-    echo "FAIL: no target detectable — expected exit 77, got $ec"
-  fi
-)
+#
+# The `cd` is confined to a subshell, but the PASS/FAIL accounting is NOT:
+# `PASS=$((PASS+1))` inside `( ... )` mutates a child shell and is discarded,
+# so this assertion used to print FAIL while the suite still reported
+# `Failed: 0` and exited 0. Measured: forcing the FAIL branch produced
+# "FAIL: no target detectable" on stdout alongside "Total: 54 | Passed: 54 |
+# Failed: 0" and exit 0. Keep the subshell around the `cd` only; count in the
+# parent.
+( cd "$(/usr/bin/mktemp -d)" && "$FILTER" issue list ) >/dev/null 2>&1
+ec=$?
+if [ "$ec" = "77" ]; then
+  PASS=$((PASS+1))
+  echo "PASS: no target detectable (in tmp non-git dir) → blocked"
+else
+  FAIL=$((FAIL+1))
+  echo "FAIL: no target detectable — expected exit 77, got $ec"
+fi
 
 echo ""
 echo "=== Allow: configured owner via --repo ==="
@@ -168,19 +185,25 @@ assert_block "api /orgs/disallowed blocked"                api /orgs/disallowed-
 
 echo ""
 echo "=== Git-remote fallback ==="
+# Both git-remote fixtures below used to `echo "PASS:"` / `echo "FAIL:"` with no
+# counter at all, inside a subshell. They printed a verdict the suite never
+# tallied: 61 PASS lines were emitted while the total read 59, and a FAIL here
+# left `Failed: 0` and exit 0. That silence covered the two assertions that gate
+# the cwd-remote inference path — the same fallback the `--owner` gap abused.
+# Confine the `cd` to a subshell; count in the parent.
 TMP=$(/usr/bin/mktemp -d)
 (
   cd "$TMP"
   /usr/bin/git init -q
   /usr/bin/git remote add origin git@github.com:disallowed-test-owner/test-repo.git
   "$FILTER" issue list >/dev/null 2>&1
-  ec=$?
-  if [ "$ec" = "77" ]; then
-    echo "PASS: git-remote third-party detected → blocked"
-  else
-    echo "FAIL: git-remote third-party not blocked (exit $ec)"
-  fi
 )
+ec=$?
+if [ "$ec" = "77" ]; then
+  PASS=$((PASS+1)); echo "PASS: git-remote third-party detected → blocked"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: git-remote third-party not blocked (exit $ec)"
+fi
 /bin/rm -rf "$TMP"
 
 TMP=$(/usr/bin/mktemp -d)
@@ -189,13 +212,13 @@ TMP=$(/usr/bin/mktemp -d)
   /usr/bin/git init -q
   /usr/bin/git remote add origin git@github.com:test-allowed-org/test-repo.git
   "$FILTER" issue list >/dev/null 2>&1
-  ec=$?
-  if [ "$ec" != "77" ]; then
-    echo "PASS: git-remote allowed-owner detected → passed through (exit $ec)"
-  else
-    echo "FAIL: git-remote allowed-owner blocked"
-  fi
 )
+ec=$?
+if [ "$ec" != "77" ]; then
+  PASS=$((PASS+1)); echo "PASS: git-remote allowed-owner detected → passed through (exit $ec)"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: git-remote allowed-owner blocked"
+fi
 /bin/rm -rf "$TMP"
 
 echo ""
