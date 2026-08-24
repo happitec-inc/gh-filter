@@ -169,6 +169,19 @@ is_allowed_owner() {
   return 1
 }
 
+# `gh project link|unlink` take `-T, --team [HOST/]OWNER/TEAM`, and per the gh
+# source the team's OWNER sets the project owner when `--owner` is absent.
+# Extract the owner: it is the component before the last in both the
+# `OWNER/TEAM` and `HOST/OWNER/TEAM` forms.
+team_owner() {
+  local v="$1" rest
+  rest="${v%/*}"          # strip /TEAM
+  case "$rest" in
+    */*) echo "${rest##*/}" ;;   # HOST/OWNER -> OWNER
+    *)   echo "$rest" ;;         # OWNER
+  esac
+}
+
 # Gate a target value that may be a COMMA-SEPARATED LIST.
 #
 # `gh search`'s --owner and --repo are `strings` flags, so `<a>,<b>` is one
@@ -441,7 +454,13 @@ TARGET_ORG=""
 # Allowlist the subcommands where --org genuinely is the target.
 # `project` belongs here too, and its absence was a hole rather than a nuance:
 # ALL 19 `gh project` subcommands take `--owner`, it is the only owner-targeting
-# flag any of them has, and 15 of the 19 are authenticated MUTATIONS: close,
+# `--owner` is NOT uniform across the tree, and the comment that used to claim
+# it was cost a review round: 16 subcommands take `--owner`, `copy` takes
+# `--source-owner`/`--target-owner` instead, `field-delete` and `item-edit`
+# take no owner flag at all, and `link`/`unlink` additionally target via
+# `--team [HOST/]OWNER/TEAM`. Every one of those is parsed below.
+#
+# 15 of the 19 are authenticated MUTATIONS: close,
 # copy, create, delete, edit, field-create, field-delete, item-add,
 # item-archive, item-create, item-delete, item-edit, link, mark-template,
 # unlink. The other four — field-list, item-list, list, view — are reads. An
@@ -466,7 +485,7 @@ case "$SUBCMD" in
   *) ORG_SUBCMD=0 ;;
 esac
 SELF_TARGET=0
-COPY_OWNERS=""
+EXTRA_OWNERS=""
 if [ "$ORG_SUBCMD" = "1" ]; then
   i=0
   args=("$@")
@@ -507,17 +526,38 @@ if [ "$ORG_SUBCMD" = "1" ]; then
       # real targets, so both are accumulated and every one must be allowed;
       # they are appended rather than last-wins, because they name different
       # things and coexist in one invocation.
+      # `--team`'s owner sets the project owner. Unparsed, all four spellings
+      # reached the binary from an allowlisted checkout while the `--repo`
+      # control on the same subcommand blocked — so it was the unparsed flag,
+      # not the fallback.
+      --team|-T)
+        if [ $((i+1)) -lt ${#args[@]} ]; then
+          v=$(team_owner "${args[$((i+1))]}")
+          if [ "$v" = "@me" ]; then SELF_TARGET=1
+          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        fi
+        ;;
+      --team=*|-T=*)
+        v=$(team_owner "${a#*=}")
+        if [ "$v" = "@me" ]; then SELF_TARGET=1
+        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        ;;
+      -T?*)
+        v=$(team_owner "${a#-T}")
+        if [ "$v" = "@me" ]; then SELF_TARGET=1
+        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        ;;
       --source-owner|--target-owner)
         if [ $((i+1)) -lt ${#args[@]} ]; then
           v="${args[$((i+1))]}"
           if [ "$v" = "@me" ]; then SELF_TARGET=1
-          else COPY_OWNERS="${COPY_OWNERS:+$COPY_OWNERS,}$v"; fi
+          else EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
         fi
         ;;
       --source-owner=*|--target-owner=*)
         v="${a#*=}"
         if [ "$v" = "@me" ]; then SELF_TARGET=1
-        else COPY_OWNERS="${COPY_OWNERS:+$COPY_OWNERS,}$v"; fi
+        else EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
         ;;
       # Attached shorthand `-oORG`. gh accepts it and routes it to the org;
       # recognising only the space-separated form left TARGET_ORG empty, so the
@@ -535,8 +575,8 @@ if [ "$ORG_SUBCMD" = "1" ]; then
   # else here (project copy has no other owner flag), but if BOTH a plain
   # --owner and a copy owner somehow appear, every named owner still has to
   # pass — so join rather than choose.
-  if [ -n "$COPY_OWNERS" ]; then
-    TARGET_ORG="${TARGET_ORG:+$TARGET_ORG,}$COPY_OWNERS"
+  if [ -n "$EXTRA_OWNERS" ]; then
+    TARGET_ORG="${TARGET_ORG:+$TARGET_ORG,}$EXTRA_OWNERS"
     SELF_TARGET=0
   fi
 fi
@@ -604,7 +644,7 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; t
           deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         fi
         ;;
-      --org|--org=*|--owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|-R|-R=*|-R?*|--repo|--repo=*)
+      --org|--org=*|--owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|--team|--team=*|-T|-T=*|-T?*|-R|-R=*|-R?*|--repo|--repo=*)
         deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         ;;
     esac
