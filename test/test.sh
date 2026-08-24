@@ -687,13 +687,34 @@ if [ "$ec" = "78" ]; then PASS=$((PASS+1)); echo "PASS: token command recursing 
   else FAIL=$((FAIL+1)); echo "FAIL: re-entry guard — expected 78, got $ec"; fi
 
 # 7. Human interactive (stderr is a TTY) → NO injection; ambient credential kept.
-#    Allocate a pty via `script` so `[ -t 2 ]` is true. Best-effort: if `script`
-#    is unavailable the case is skipped rather than failing the suite.
+#    Allocate a pty via `script` so `[ -t 2 ]` is true.
+#
+#    `< /dev/null` is REQUIRED, not tidiness. macOS `script` calls tcgetattr on
+#    its OWN stdin to clone terminal settings, so its behaviour depends on what
+#    stdin it inherits — measured:
+#
+#      socket  -> "script: tcgetattr/ioctl: Operation not supported on socket",
+#                 exit 1, no output
+#      pipe    -> runs, but the capture comes back EMPTY
+#      /dev/null or a regular file -> works; 0 failures in 60 consecutive runs
+#
+#    That is the whole of the ~6% flake this assertion used to carry (issue #6):
+#    the verdict depended on how the suite itself had been invoked, not on the
+#    filter. Pinning stdin removes the dependency.
+#
+#    The exit status is checked separately from the substring so an INSTRUMENT
+#    failure can never be reported as a filter verdict — the distinction issue
+#    #6 asked for.
 if command -v script >/dev/null 2>&1; then
-  tty_out=$(script -q /dev/null env GH_FILTER_REAL_GH="$STUB_GH" \
+  tty_raw=$(script -q /dev/null env GH_FILTER_REAL_GH="$STUB_GH" \
       GH_FILTER_AGENT_TOKEN_COMMAND="$TOK_CMD" GH_FILTER_AGENT_MARKER_ENVS=TEST_MARKER \
-      "$FILTER" api /user 2>/dev/null | /usr/bin/tr -d '\r')
-  if [[ "$tty_out" == *"REALGH_TOKEN=<none>"* ]]; then
+      "$FILTER" api /user < /dev/null 2>&1)
+  tty_ec=$?
+  tty_out=$(printf '%s' "$tty_raw" | /usr/bin/tr -d '\r')
+  if [ "$tty_ec" != "0" ] || [ -z "$tty_out" ]; then
+    FAIL=$((FAIL+1))
+    echo "FAIL: human TTY — INSTRUMENT failure, not a filter verdict (script exit $tty_ec, output '$tty_out')"
+  elif [[ "$tty_out" == *"REALGH_TOKEN=<none>"* ]]; then
     PASS=$((PASS+1)); echo "PASS: human TTY (no marker) → no injection, ambient credential"
   else
     FAIL=$((FAIL+1)); echo "FAIL: human TTY passthrough  (got '$tty_out')"
