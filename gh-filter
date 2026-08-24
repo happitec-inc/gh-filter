@@ -445,7 +445,9 @@ TARGET_ORG=""
 # copy, create, delete, edit, field-create, field-delete, item-add,
 # item-archive, item-create, item-delete, item-edit, link, mark-template,
 # unlink. The other four — field-list, item-list, list, view — are reads. An
-# enumeration invites checking, so it should be checkable: 15 + 4 = 19. With `project` absent, `--owner` went unparsed,
+# enumeration invites checking, so it should be checkable: 15 + 4 = 19.
+#
+# With `project` absent, `--owner` went unparsed,
 # detection found nothing, and the cwd-remote fallback gated the call on the
 # local checkout's owner — so `project delete 1 --owner <foreign>` ran from any
 # allowlisted checkout reached the real binary. There is no `-o` shorthand
