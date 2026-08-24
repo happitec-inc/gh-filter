@@ -81,14 +81,113 @@ An earlier implementation symlinked `/opt/homebrew/bin/gh` directly to the filte
 3. If outside the list: refuses, prints a verbose error to stderr, calls `notify` for a Pushover alert (if available), exits `77`.
 4. If inside the list (or the call doesn't touch a repo): execs the real `gh` with the original args.
 
-Target repo detection sources, in order:
+Target detection sources, in order:
 
-1. `--repo OWNER/NAME` or `-R OWNER/NAME` (also `=` form)
-2. For `gh api`: `/repos/OWNER/NAME/...` extracted from the path argument
-3. For `gh repo <verb>`: positional `OWNER/NAME` argument
-4. Fallback: `git config --get remote.origin.url` in the current directory
+1. **An org flag** — `--org`, `--owner`, or `-o` — on a subcommand where that flag names the target (see [Org-targeted commands](#org-targeted-commands))
+2. `--repo OWNER/NAME` or `-R OWNER/NAME` (also `=` and attached forms)
+3. For `gh api`: `/repos/OWNER/NAME/...` extracted from the path argument
+4. For `gh repo <verb>`: positional `OWNER/NAME` argument
+5. Fallback: `git config --get remote.origin.url` in the current directory
+
+Two properties of that list are worth stating plainly, because they are the difference between a gate and a guess:
+
+- **An explicit flag beats the git-remote fallback.** Step 5 infers a target from wherever the process happens to be standing. Steps 1–4 determine one from the arguments. If argv names a target, the fallback is not consulted — otherwise `gh secret set --org some-org`, run from inside an unrelated checkout, would be gated on *that checkout's* owner rather than on the org being addressed.
+- **The scanners are positional-naive.** They walk argv word by word, with no `--` end-of-options handling and no notion of which words are a flag's *value* rather than a flag. This is why the guard below errs toward refusing.
 
 If no target can be determined and the subcommand isn't a recognized no-repo operation (`auth status`, `--version`, `api /user`, etc.), the call is refused with a suggestion to pass `--repo` explicitly.
+
+## Org-targeted commands
+
+Some `gh` subcommands operate on an **organization**, not a repo. There is no `OWNER/NAME` anywhere in argv, so without special handling these calls fell through to the deny above — a false block on a perfectly legal call, whose suggested remedy (`--repo OWNER/NAME`) does not exist for a command that has no repo.
+
+The org is gated through the same allowlist as a repo owner. This widens the argument **forms** the filter understands; it never widens the set of permitted owners.
+
+### Which subcommands
+
+`--org` / `--owner` / `-o` is treated as the target only for subcommands where it genuinely *is* the target:
+
+`secret` · `variable` · `ruleset` · `codespace` · `attestation` · `project` · `search` · `skill`
+
+`repo` is deliberately **excluded**. Two reasons, both load-bearing:
+
+- On `gh repo fork --org X`, `--org` names the fork *destination* while the write lands on the foreign upstream. Treating it as the target would let `gh repo fork some-other-org/thing --org your-org` through.
+- On `gh repo read-file -o out.txt`, `-o` is `--output`. Treating it as an org would swallow a filename and false-block.
+
+### Accepted spellings
+
+All of these are recognised, for both `--org` and `--owner`:
+
+```bash
+gh secret list --org your-org           # space-separated
+gh secret list --org=your-org           # =-joined
+gh secret list -o your-org              # shorthand
+gh secret list -o=your-org              # =-joined shorthand
+gh secret list -oyour-org               # attached shorthand
+```
+
+Missing any one of these spellings is not cosmetic. An unrecognised spelling used to leave the target unset, which sent the call to the git-remote fallback — so from inside any allowlisted checkout, a call naming a *foreign* org passed straight through.
+
+### List values
+
+`--owner` and `--repo` are `strings` (list) flags on `gh search`, so a comma-separated value is legal. **Every element is gated, and one foreign element blocks the whole call** — `gh` queries all of them, so a partial check would be no check.
+
+```bash
+gh search repos --owner your-org,another-org      # allowed if BOTH are allowlisted
+gh search repos --owner your-org,some-other-org   # BLOCKED, names the offending element
+gh search code  --repo your-org/a,your-org/b foo  # per-element, same rule
+```
+
+A value that names no owner at all is refused rather than passed:
+
+```bash
+gh secret list --org ,                             # blocked: no owner parsed
+```
+
+### `--owner @me`
+
+`@me` is documented and legal on every `gh project` subcommand. It names the **authenticated identity**, not a third party, so it is neither an org to look up nor a target to infer — it is allowed explicitly:
+
+```bash
+gh project list --owner @me                        # allowed
+```
+
+It is still refused when no allowlist is configured, because "no allowlist" means the shim is not set up, and the answer to every call in that state is no — including one targeting the caller.
+
+### Repeated flags: the last one wins
+
+`gh` uses the **last** occurrence of a repeated flag (Cobra behaviour: `gh browse -R aaa/one -R bbb/two -n` opens `bbb/two`). The filter matches that, so a harmless first value cannot shield a foreign second one:
+
+```bash
+gh project delete 1 --owner @me --owner some-other-org   # BLOCKED on the foreign owner
+gh secret list --org your-org --org some-other-org       # BLOCKED on the foreign org
+```
+
+## Restriction: unparsed target flags are refused, not guessed
+
+If argv names a target through a flag the filter recognises the *shape* of but did not consume, the call is **refused** rather than resolved from the current directory:
+
+```bash
+$ gh issue list --owner some-other-org
+gh-filter: BLOCKED
+Detected target: <unparsed target flag: --owner>
+Reason:          argv names a target via '--owner' that this filter did not parse;
+                 refusing to infer the target from the current directory
+```
+
+**Why this exists.** Five separate argv spellings were added to the parser in five separate fixes, and *every* miss failed **open** — an unrecognised target flag left the target empty, and the fallback treated "I parsed nothing" as licence to guess from the current directory. For a shim whose contract is *fail closed when it cannot determine the target*, that is the contract inverted. Enumerating spellings can only ever be complete as of the `gh` version last read; this closes the class rather than the next instance.
+
+**What it means for you.** If you see this block on a call you believe is legitimate, the filter is telling you it does not understand that flag on that subcommand — not that the owner is disallowed. Either name the target a way it does parse (`--repo OWNER/NAME`), or file an issue so the subcommand is handled properly.
+
+**Its limits, stated rather than implied:** it recognises only flag shapes already known, so a future target flag spelled some other way still slips past; and because the scanners are positional-naive, a literal `--org` appearing as some *other* flag's value will trip it. That direction fails closed and is recoverable.
+
+`-o` is guarded only on the org-targeting subcommands above, since elsewhere it may mean `--output`.
+
+## Known gaps
+
+Documented rather than implied, because a containment control that overstates its coverage is worse than one that does not:
+
+- **`gh status --org` and `gh extension search --owner` are never gated.** Both are exec'd as pass-through *above* target detection, so adding them to the org-subcommand list would not help — the fix has to move the check. Both leak only public activity/listing data. Tracked as issue #8.
+- **Owner comparison is case-sensitive** while GitHub treats owner names case-insensitively, so an owner may need listing in more than one spelling. Fails closed. Tracked as issue #7.
 
 ## Agent-identity injection (optional)
 
