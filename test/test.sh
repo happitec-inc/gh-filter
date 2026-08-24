@@ -293,7 +293,9 @@ assert_in_allowlisted_checkout "search --team-mentions allowed/x"          allow
 # gated: an allowlisted upstream does not license a foreign destination, and
 # round 2's closure (foreign upstream, allowlisted destination) must survive.
 assert_in_allowlisted_checkout "repo fork allowed/x --org disallowed"      block repo fork test-allowed-org/x --org disallowed-test-owner
-assert_in_allowlisted_checkout "repo fork allowed/x -o disallowed"         block repo fork test-allowed-org/x -o disallowed-test-owner
+# NOTE: `gh repo fork` has no `-o` shorthand — receipt: `--org string`, no
+# shorthand listed. This asserted on argv gh rejects, which is a test of
+# nothing. The long form above is the real case.
 assert_in_allowlisted_checkout "repo fork disallowed/x --org allowed"      block repo fork disallowed-test-owner/x --org test-allowed-org
 assert_in_allowlisted_checkout "repo fork allowed/x --org allowed"         allow repo fork test-allowed-org/x --org test-allowed-org
 # The previous version of this used --repo, which sets TARGET_REPO and
