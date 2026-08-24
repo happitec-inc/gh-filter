@@ -320,27 +320,27 @@ i=0
 args=("$@")
 while [ $i -lt ${#args[@]} ]; do
   a="${args[$i]}"
+  # LAST occurrence wins, matching gh — see the note on the org loop below for
+  # the `gh browse -R a/x -R b/y -n` receipt. Breaking on the first match gated
+  # `-R <allowed>/x -R <foreign>/y` on the allowlisted one while gh targeted the
+  # foreign one.
   case "$a" in
     --repo|-R)
       if [ $((i+1)) -lt ${#args[@]} ]; then
         TARGET_REPO="${args[$((i+1))]}"
       fi
-      break
       ;;
     --repo=*)
       TARGET_REPO="${a#--repo=}"
-      break
       ;;
     -R=*)
       TARGET_REPO="${a#-R=}"
-      break
       ;;
     # Attached shorthand: `gh issue list -Rowner/name`. gh accepts it; missing it
     # here left TARGET_REPO empty and the call fell through to the cwd-remote
     # fallback, i.e. gated on the WRONG owner.
     -R?*)
       TARGET_REPO="${a#-R}"
-      break
       ;;
   esac
   i=$((i+1))
@@ -361,16 +361,24 @@ TARGET_ORG=""
 # Allowlist the subcommands where --org genuinely is the target.
 # `project` belongs here too, and its absence was a hole rather than a nuance:
 # ALL 19 `gh project` subcommands take `--owner`, it is the only owner-targeting
-# flag any of them has, and eleven of them are authenticated MUTATIONS
-# (item-add, item-delete, delete, edit, field-create, field-delete, close, copy,
-# link, unlink, mark-template). With `project` absent, `--owner` went unparsed,
+# flag any of them has, and 14 of the 19 are authenticated MUTATIONS
+# (item-add, item-create, item-edit, item-archive, item-delete, delete, edit,
+# field-create, field-delete, close, copy, link, unlink, mark-template). With `project` absent, `--owner` went unparsed,
 # detection found nothing, and the cwd-remote fallback gated the call on the
 # local checkout's owner — so `project delete 1 --owner <foreign>` ran from any
 # allowlisted checkout reached the real binary. There is no `-o` shorthand
 # anywhere in the `project` tree, so the `--output` collision that keeps `repo`
 # off this list does not apply.
+# `search {repos,issues,code,commits,prs}` and `skill search` take `--owner`
+# too. Receipt: `gh search repos --help` gives `--owner strings   Filter on
+# owner`, and NONE of the six has an `-o` shorthand (checked each `--help`), so
+# the `--output` collision that keeps `repo` off this list does not apply.
+# Adding them is a net tightening — `search --owner <foreign>` was previously
+# gated on the cwd — and it is also what stops the fail-closed guard below from
+# false-blocking `search --owner <allowed>`, which is the routine pre-file
+# duplicate scan.
 case "$SUBCMD" in
-  secret|variable|ruleset|codespace|attestation|project) ORG_SUBCMD=1 ;;
+  secret|variable|ruleset|codespace|attestation|project|search|skill) ORG_SUBCMD=1 ;;
   *) ORG_SUBCMD=0 ;;
 esac
 SELF_TARGET=0
@@ -379,29 +387,33 @@ if [ "$ORG_SUBCMD" = "1" ]; then
   args=("$@")
   while [ $i -lt ${#args[@]} ]; do
     a="${args[$i]}"
+    # LAST occurrence wins, matching gh. Cobra takes the final value of a
+    # repeated flag — receipt, offline: `gh browse -R aaa-first/one
+    # -R bbb-second/two -n` prints https://github.com/bbb-second/two. This loop
+    # used to `break` on the FIRST match, so `--owner @me --owner <foreign>`
+    # was gated on `@me` while gh targeted <foreign>. Record and keep walking.
+    #
     # `@me` is documented and legal on every `gh project` subcommand
     # (`--owner string   Login of the owner. Use "@me" for the current user.`).
-    # It names the AUTHENTICATED IDENTITY, not a third party — the very account
-    # this shim's allowlist exists to keep inside its lane — so it is neither an
-    # org to look up nor a target to infer. It will never appear in an
-    # allowlist, so gating it would false-block; falling through to the
-    # cwd-remote fallback would gate it on an unrelated checkout's owner, which
-    # is the laundering this PR exists to stop. Record it and allow explicitly.
+    # It names the AUTHENTICATED IDENTITY, not a third party, so it is neither
+    # an org to look up nor a target to infer. Gating it would false-block;
+    # falling through to the cwd-remote fallback would gate it on an unrelated
+    # checkout's owner, which is the laundering this branch exists to stop.
+    # Record it and allow explicitly — behind the empty-allowlist guard.
     case "$a" in
       --org|-o|--owner)
         if [ $((i+1)) -lt ${#args[@]} ]; then
           if [ "${args[$((i+1))]}" = "@me" ]; then
-            SELF_TARGET=1
+            SELF_TARGET=1; TARGET_ORG=""
           else
-            TARGET_ORG="${args[$((i+1))]}"
+            TARGET_ORG="${args[$((i+1))]}"; SELF_TARGET=0
           fi
         fi
-        break
         ;;
       --org=*|--owner=*|-o=*)
         v="${a#*=}"
-        if [ "$v" = "@me" ]; then SELF_TARGET=1; else TARGET_ORG="$v"; fi
-        break
+        if [ "$v" = "@me" ]; then SELF_TARGET=1; TARGET_ORG=""
+        else TARGET_ORG="$v"; SELF_TARGET=0; fi
         ;;
       # Attached shorthand `-oORG`. gh accepts it and routes it to the org;
       # recognising only the space-separated form left TARGET_ORG empty, so the
@@ -409,8 +421,8 @@ if [ "$ORG_SUBCMD" = "1" ]; then
       # that passed a FOREIGN org's call straight through.
       -o?*)
         v="${a#-o}"
-        if [ "$v" = "@me" ]; then SELF_TARGET=1; else TARGET_ORG="$v"; fi
-        break
+        if [ "$v" = "@me" ]; then SELF_TARGET=1; TARGET_ORG=""
+        else TARGET_ORG="$v"; SELF_TARGET=0; fi
         ;;
     esac
     i=$((i+1))
@@ -469,7 +481,18 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; t
   for a in "$@"; do
     case "$a" in
       --) break ;;
-      -o|-o=*|-o?*|--org|--org=*|--owner|--owner=*|-R|-R=*|-R?*|--repo|--repo=*)
+      # `--org`/`--owner`/`--repo`/`-R` name a target wherever they appear, so
+      # they are guarded unconditionally. `-o` is NOT unambiguous: on
+      # `repo read-file` it is `--output`, and guarding it everywhere
+      # false-blocked `repo read-file -o out.txt` — the canonical use of that
+      # command, and the very collision cited as the reason `repo` stays out of
+      # ORG_SUBCMD. Guard `-o` only where it means an org.
+      -o|-o=*|-o?*)
+        if [ "$ORG_SUBCMD" = "1" ]; then
+          deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
+        fi
+        ;;
+      --org|--org=*|--owner|--owner=*|-R|-R=*|-R?*|--repo|--repo=*)
         deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         ;;
     esac
@@ -515,20 +538,43 @@ if [ -n "$TARGET_REPO" ]; then
 fi
 
 # Org-targeted call (no repo). Same allowlist, same deny path.
+#
+# `gh search`'s --owner is a `strings` flag ("--owner strings   Filter on
+# owner"), so a legal value can be a comma-separated LIST. Comparing the raw
+# string would false-block `search repos --owner <allowed1>,<allowed2>` and,
+# worse, would let nobody notice that `<allowed>,<foreign>` names a foreign org
+# too. Split and require EVERY element to be allowed.
 if [ -n "$TARGET_ORG" ]; then
   if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
     deny "$TARGET_ORG" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
   fi
-  if is_allowed_owner "$TARGET_ORG"; then
-    exec "$REAL_GH" "$@"
-  fi
-  deny "$TARGET_ORG" "org '$TARGET_ORG' is not in the allowed list"
+  ORG_IFS_SAVE="$IFS"
+  IFS=','
+  # shellcheck disable=SC2206
+  ORG_PARTS=($TARGET_ORG)
+  IFS="$ORG_IFS_SAVE"
+  for one_org in "${ORG_PARTS[@]}"; do
+    [ -n "$one_org" ] || continue
+    if ! is_allowed_owner "$one_org"; then
+      deny "$TARGET_ORG" "org '$one_org' is not in the allowed list"
+    fi
+  done
+  exec "$REAL_GH" "$@"
 fi
 
 # `--owner @me`: the target is the authenticated identity itself. Nothing to
 # look up against the allowlist, and nothing to infer — allow it explicitly
 # rather than letting it fall through to the cwd-remote guess.
 if [ "$SELF_TARGET" = "1" ]; then
+  # "No allowlist configured" means THIS SHIM IS NOT SET UP, and the correct
+  # answer to every call in that state is no — including one whose target is
+  # the caller itself. Skipping this check made a fresh install, before its
+  # config is written, exec `project delete N --owner @me` (no confirmation
+  # flag) unguarded. Measured regression: `secret list --org @me` with no
+  # config went 77 -> 0 when the self-target path was introduced.
+  if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
+    deny "@me" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
+  fi
   exec "$REAL_GH" "$@"
 fi
 
