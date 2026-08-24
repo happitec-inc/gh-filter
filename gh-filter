@@ -169,6 +169,60 @@ is_allowed_owner() {
   return 1
 }
 
+# Gate a target value that may be a COMMA-SEPARATED LIST.
+#
+# `gh search`'s --owner and --repo are `strings` flags, so `<a>,<b>` is one
+# legal value. Two rules, and both are load-bearing:
+#
+#   - EVERY element must be allowed. One foreign element makes the whole call
+#     foreign, because gh queries all of them.
+#   - The DEFAULT IS DENY. The first version of this put `deny` inside the loop
+#     and `exec` after it, so a value that produced ZERO elements — `--org ,` —
+#     ran an empty loop and fell straight through to the exec. Measured ALLOW.
+#     A gate whose safe answer depends on the loop body executing is not a gate.
+#
+# Globbing is disabled for the split. Word-splitting an unquoted value with
+# pathname expansion live let `--org '*'` expand against the CURRENT DIRECTORY,
+# so a directory holding a file named after an allowlisted owner turned into an
+# allow. Filesystem contents must not be an input to this decision.
+#
+# $1 = the raw value, $2 = "org" or "repo" (repo elements are OWNER/NAME).
+# Echoes the offending element and returns 1 on refusal; returns 0 only when at
+# least one element was checked and all of them passed.
+all_elements_allowed() {
+  local raw="$1" kind="$2"
+  local saved_ifs="$IFS" saved_glob=0 el owner seen=0
+  case "$-" in *f*) saved_glob=1 ;; esac
+  set -f
+  IFS=','
+  # shellcheck disable=SC2206
+  local parts=($raw)
+  IFS="$saved_ifs"
+  [ "$saved_glob" = "1" ] || set +f
+  if [ "${#parts[@]}" -eq 0 ]; then
+    echo "<no target parsed from '$raw'>"
+    return 1
+  fi
+  for el in "${parts[@]}"; do
+    [ -n "$el" ] || continue
+    if [ "$kind" = "repo" ]; then
+      owner="${el%%/*}"
+    else
+      owner="$el"
+    fi
+    if [ -z "$owner" ] || ! is_allowed_owner "$owner"; then
+      echo "$owner"
+      return 1
+    fi
+    seen=$((seen+1))
+  done
+  if [ "$seen" -eq 0 ]; then
+    echo "<no target parsed from '$raw'>"
+    return 1
+  fi
+  return 0
+}
+
 # ---- Agent-identity resolution ----------------------------------------------
 # This stage decides WHICH identity a call runs as; the allowlist gate below
 # decides WHETHER the call is permitted. Two separate jobs, two separate stages,
@@ -527,14 +581,17 @@ if [ "$ORG_SUBCMD" = "1" ] && [ -n "$TARGET_ORG" ] && [ -n "$TARGET_REPO" ]; the
 fi
 
 if [ -n "$TARGET_REPO" ]; then
-  OWNER="${TARGET_REPO%%/*}"
   if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
     deny "$TARGET_REPO" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
   fi
-  if is_allowed_owner "$OWNER"; then
+  # --repo is a `strings` flag on the same `gh search` commands as --owner, so
+  # it takes a list too. Comparing the raw string let
+  # `search code --repo <allowed>/x,<foreign>/y` through while the same call
+  # without the comma blocked.
+  if BAD_OWNER=$(all_elements_allowed "$TARGET_REPO" repo); then
     exec "$REAL_GH" "$@"
   fi
-  deny "$TARGET_REPO" "owner '$OWNER' is not in the allowed list"
+  deny "$TARGET_REPO" "owner '$BAD_OWNER' is not in the allowed list"
 fi
 
 # Org-targeted call (no repo). Same allowlist, same deny path.
@@ -548,18 +605,10 @@ if [ -n "$TARGET_ORG" ]; then
   if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
     deny "$TARGET_ORG" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
   fi
-  ORG_IFS_SAVE="$IFS"
-  IFS=','
-  # shellcheck disable=SC2206
-  ORG_PARTS=($TARGET_ORG)
-  IFS="$ORG_IFS_SAVE"
-  for one_org in "${ORG_PARTS[@]}"; do
-    [ -n "$one_org" ] || continue
-    if ! is_allowed_owner "$one_org"; then
-      deny "$TARGET_ORG" "org '$one_org' is not in the allowed list"
-    fi
-  done
-  exec "$REAL_GH" "$@"
+  if BAD_OWNER=$(all_elements_allowed "$TARGET_ORG" org); then
+    exec "$REAL_GH" "$@"
+  fi
+  deny "$TARGET_ORG" "org '$BAD_OWNER' is not in the allowed list"
 fi
 
 # `--owner @me`: the target is the authenticated identity itself. Nothing to
