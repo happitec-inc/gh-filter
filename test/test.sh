@@ -40,6 +40,34 @@ assert_exit() {
   fi
 }
 
+# Run one call from inside a throwaway checkout whose remote is an ALLOWLISTED
+# owner, and assert the verdict. This fixture is the point, not a detail: the
+# cwd-remote fallback only *launders* a foreign target when the local checkout
+# is allowlisted, which is the normal agent state. Assertions run from the
+# suite's own directory block for the wrong reason (its remote is not in the
+# test allowlist) and so stay green through the very regression they name.
+assert_in_allowlisted_checkout() {
+  local label="$1"; shift
+  local expected="$1"; shift
+  local tmp; tmp=$(/usr/bin/mktemp -d)
+  (
+    cd "$tmp"
+    /usr/bin/git init -q
+    /usr/bin/git remote add origin git@github.com:test-allowed-org/test-repo.git
+    "$FILTER" "$@" >/dev/null 2>&1
+  )
+  local ec=$?
+  /bin/rm -rf "$tmp"
+  if [ "$expected" = "block" ] && [ "$ec" = "77" ]; then
+    PASS=$((PASS+1)); echo "PASS: $label (blocked from allowlisted checkout)"
+  elif [ "$expected" = "allow" ] && [ "$ec" != "77" ]; then
+    PASS=$((PASS+1)); echo "PASS: $label (passed through, gh exit $ec)"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: $label  (expected $expected, exit $ec)"
+    echo "       cmd: gh $*"
+  fi
+}
+
 assert_block() {
   local label="$1"; shift
   assert_exit "$label" 77 "$@"
@@ -129,6 +157,35 @@ assert_allow "attestation verify --owner=allowed"    attestation verify --owner=
 assert_block "attestation verify --owner disallowed" attestation verify --owner disallowed-test-owner /nonexistent-subject
 assert_block "attestation verify --owner=disallowed" attestation verify --owner=disallowed-test-owner /nonexistent-subject
 
+# --- `gh project`: --owner on 19 subcommands, 11 of them writes -------------
+# Receipt: `gh project item-add --help` documents
+#   `--owner string   Login of the owner. Use "@me" for the current user.`
+# `project` was absent from ORG_SUBCMD, so --owner went unparsed and the
+# cwd-remote fallback gated these on the local checkout. The write verbs are
+# the ones that matter: item-add/item-delete/delete mutate a project owned by
+# whatever org --owner names.
+assert_allow "project list --owner allowed"       project list --owner test-allowed-org
+# These MUST run from an allowlisted checkout to mean anything. Measured: run
+# from the suite's own directory they pass even with `project` absent from
+# ORG_SUBCMD and the fail-closed guard removed — the pre-PR world — because the
+# suite's remote is not in the test allowlist, so the fallback blocks for an
+# unrelated reason. From an allowlisted checkout they go red in that world,
+# which is what makes them a guard on the write verbs.
+assert_in_allowlisted_checkout "project delete --owner disallowed"   block project delete 1 --owner disallowed-test-owner
+assert_in_allowlisted_checkout "project item-add --owner=disallowed" block project item-add 1 --owner=disallowed-test-owner --url https://example.invalid/x
+assert_in_allowlisted_checkout "project item-delete -odisallowed"    block project item-delete 1 -odisallowed-test-owner --id X
+
+# `--owner @me` names the authenticated identity, not a third party. It will
+# never appear in an allowlist, so it must be allowed explicitly rather than
+# gated or inferred — otherwise this is the third false-block of this PR.
+assert_allow "project list --owner @me"           project list --owner @me
+# NOTE: `assert_allow` execs the REAL `gh` — the filter passing a call through is
+# the whole point of the assertion. So an allow case must never name a mutating
+# verb. `gh project delete` takes no confirmation flag and deletes immediately.
+# Read-only verbs only here; the mutating verbs are covered by BLOCK cases
+# above, which never reach the real binary.
+assert_allow "project view --owner=@me"           project view 1 --owner=@me --format json
+
 assert_block "api /repos/disallowed/X"            api /repos/disallowed-test-owner/test-repo
 assert_block "api repos/disallowed/X (no slash)"  api repos/disallowed-test-owner/test-repo/issues
 assert_block "api -X POST /repos/disallowed/X"    api -X POST /repos/disallowed-test-owner/test-repo/issues
@@ -150,8 +207,9 @@ assert_block "extension install"            extension install disallowed-test-ow
 # `PASS=$((PASS+1))` inside `( ... )` mutates a child shell and is discarded,
 # so this assertion used to print FAIL while the suite still reported
 # `Failed: 0` and exited 0. Measured: forcing the FAIL branch produced
-# "FAIL: no target detectable" on stdout alongside "Total: 54 | Passed: 54 |
-# Failed: 0" and exit 0. Keep the subshell around the `cd` only; count in the
+# "FAIL: no target detectable" on stdout alongside a total that counted
+# neither it nor the two git-remote assertions (61 PASS lines printed, "Total:
+# 59" reported) and exit 0. Keep the subshell around the `cd` only; count in the
 # parent.
 ( cd "$(/usr/bin/mktemp -d)" && "$FILTER" issue list ) >/dev/null 2>&1
 ec=$?
@@ -218,6 +276,45 @@ if [ "$ec" != "77" ]; then
   PASS=$((PASS+1)); echo "PASS: git-remote allowed-owner detected → passed through (exit $ec)"
 else
   FAIL=$((FAIL+1)); echo "FAIL: git-remote allowed-owner blocked"
+fi
+/bin/rm -rf "$TMP"
+
+# --- Fail closed when argv names a target this parser did not consume -------
+# The discriminating fixture is an ALLOWLISTED checkout: that is the normal
+# agent state, and it is what made every previous parse miss fail OPEN. `issue`
+# is not an ORG_SUBCMD, so `--owner` is not parsed; before the guard, detection
+# found nothing, the cwd-remote fallback resolved the allowlisted local owner,
+# and the call was allowed while argv was visibly naming a different one.
+TMP=$(/usr/bin/mktemp -d)
+(
+  cd "$TMP"
+  /usr/bin/git init -q
+  /usr/bin/git remote add origin git@github.com:test-allowed-org/test-repo.git
+  "$FILTER" issue list --owner disallowed-test-owner >/dev/null 2>&1
+)
+ec=$?
+if [ "$ec" = "77" ]; then
+  PASS=$((PASS+1)); echo "PASS: unparsed target flag in allowlisted checkout → blocked, not inferred"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: unparsed target flag inferred from cwd instead of blocking (exit $ec)"
+fi
+/bin/rm -rf "$TMP"
+
+# Control on the guard's blast radius: ordinary argv in the same fixture must
+# still pass through. A guard that blocks everything would satisfy the
+# assertion above while breaking every real call.
+TMP=$(/usr/bin/mktemp -d)
+(
+  cd "$TMP"
+  /usr/bin/git init -q
+  /usr/bin/git remote add origin git@github.com:test-allowed-org/test-repo.git
+  "$FILTER" issue list >/dev/null 2>&1
+)
+ec=$?
+if [ "$ec" != "77" ]; then
+  PASS=$((PASS+1)); echo "PASS: guard does not fire on ordinary argv (exit $ec)"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: guard blocked ordinary argv"
 fi
 /bin/rm -rf "$TMP"
 

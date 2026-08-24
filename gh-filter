@@ -303,6 +303,15 @@ if [ "$SUBCMD" = "api" ]; then
 fi
 
 # ---- Target repo detection --------------------------------------------------
+#
+# Two properties of everything below, stated once so nobody has to rediscover
+# them: the scanners are POSITIONAL-NAIVE (they walk argv looking at each word
+# in isolation — no `--` end-of-options handling, no notion of which words are
+# a flag's VALUE rather than a flag), and step 4's git-remote read is a GUESS,
+# not a determination. Steps 1-3 determine a target from argv; step 4 infers one
+# from where the process happens to be standing, which is a different and much
+# weaker claim. Anything that reaches step 4 with argv visibly naming a target
+# is now refused rather than guessed at — see the guard above it.
 
 TARGET_REPO=""
 
@@ -350,58 +359,62 @@ TARGET_ORG=""
 # `repo fork <foreign>/x --org <allowed>` through. `gh repo read-file` uses -o
 # for --output, which would swallow a filename as an org and false-block.
 # Allowlist the subcommands where --org genuinely is the target.
+# `project` belongs here too, and its absence was a hole rather than a nuance:
+# ALL 19 `gh project` subcommands take `--owner`, it is the only owner-targeting
+# flag any of them has, and eleven of them are authenticated MUTATIONS
+# (item-add, item-delete, delete, edit, field-create, field-delete, close, copy,
+# link, unlink, mark-template). With `project` absent, `--owner` went unparsed,
+# detection found nothing, and the cwd-remote fallback gated the call on the
+# local checkout's owner — so `project delete 1 --owner <foreign>` ran from any
+# allowlisted checkout reached the real binary. There is no `-o` shorthand
+# anywhere in the `project` tree, so the `--output` collision that keeps `repo`
+# off this list does not apply.
 case "$SUBCMD" in
-  secret|variable|ruleset|codespace|attestation) ORG_SUBCMD=1 ;;
+  secret|variable|ruleset|codespace|attestation|project) ORG_SUBCMD=1 ;;
   *) ORG_SUBCMD=0 ;;
 esac
+SELF_TARGET=0
 if [ "$ORG_SUBCMD" = "1" ]; then
-i=0
-args=("$@")
-while [ $i -lt ${#args[@]} ]; do
-  a="${args[$i]}"
-  case "$a" in
-    --org|-o)
-      if [ $((i+1)) -lt ${#args[@]} ]; then
-        TARGET_ORG="${args[$((i+1))]}"
-      fi
-      break
-      ;;
-    --org=*)
-      TARGET_ORG="${a#--org=}"
-      break
-      ;;
-    # Attached and =-joined shorthand: `-oORG`, `-o=ORG`. gh accepts both and
-    # routes them to the org. Recognising only the space-separated form left
-    # TARGET_ORG empty, so the cwd-remote fallback decided the verdict — from
-    # any allowlisted checkout that passed a FOREIGN org's call straight through.
-    -o=*)
-      TARGET_ORG="${a#-o=}"
-      break
-      ;;
-    -o?*)
-      TARGET_ORG="${a#-o}"
-      break
-      ;;
-    # `--owner` is the long form on some org-targeting subcommands: `gh
-    # attestation verify --owner ORG` names the org whose artefacts are queried,
-    # and `-o` is its shorthand. Matching only `--org` left TARGET_ORG empty for
-    # the long form, so detection fell through to the cwd-remote fallback and
-    # `attestation verify --owner <foreign>` was ALLOWED from any allowlisted
-    # checkout while `-o <foreign>` blocked. Read-only, but the allowlist
-    # comment claimed a coverage the parser did not provide.
-    --owner)
-      if [ $((i+1)) -lt ${#args[@]} ]; then
-        TARGET_ORG="${args[$((i+1))]}"
-      fi
-      break
-      ;;
-    --owner=*)
-      TARGET_ORG="${a#--owner=}"
-      break
-      ;;
-  esac
-  i=$((i+1))
-done
+  i=0
+  args=("$@")
+  while [ $i -lt ${#args[@]} ]; do
+    a="${args[$i]}"
+    # `@me` is documented and legal on every `gh project` subcommand
+    # (`--owner string   Login of the owner. Use "@me" for the current user.`).
+    # It names the AUTHENTICATED IDENTITY, not a third party — the very account
+    # this shim's allowlist exists to keep inside its lane — so it is neither an
+    # org to look up nor a target to infer. It will never appear in an
+    # allowlist, so gating it would false-block; falling through to the
+    # cwd-remote fallback would gate it on an unrelated checkout's owner, which
+    # is the laundering this PR exists to stop. Record it and allow explicitly.
+    case "$a" in
+      --org|-o|--owner)
+        if [ $((i+1)) -lt ${#args[@]} ]; then
+          if [ "${args[$((i+1))]}" = "@me" ]; then
+            SELF_TARGET=1
+          else
+            TARGET_ORG="${args[$((i+1))]}"
+          fi
+        fi
+        break
+        ;;
+      --org=*|--owner=*|-o=*)
+        v="${a#*=}"
+        if [ "$v" = "@me" ]; then SELF_TARGET=1; else TARGET_ORG="$v"; fi
+        break
+        ;;
+      # Attached shorthand `-oORG`. gh accepts it and routes it to the org;
+      # recognising only the space-separated form left TARGET_ORG empty, so the
+      # cwd-remote fallback decided the verdict — from any allowlisted checkout
+      # that passed a FOREIGN org's call straight through.
+      -o?*)
+        v="${a#-o}"
+        if [ "$v" = "@me" ]; then SELF_TARGET=1; else TARGET_ORG="$v"; fi
+        break
+        ;;
+    esac
+    i=$((i+1))
+  done
 fi
 
 # 2. `gh api`: extract /repos/OWNER/NAME from a path arg.
@@ -436,7 +449,35 @@ fi
 # An explicit --org beats an inferred remote: `gh secret set --org X` run from
 # inside some unrelated checkout must be gated on X, not on that checkout's
 # owner. Inferring the target from the cwd there is simply the wrong answer.
-if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SUBCMD" != "api" ]; then
+#
+# Before inferring anything, refuse to infer at all when argv is visibly naming
+# a target this parser did not consume. Five spellings have now been added in
+# five separate patches (-R?*, -o=*, -o?*, --owner, project --owner) and EVERY
+# miss failed OPEN: an unrecognised target flag leaves TARGET_REPO/TARGET_ORG
+# empty, and the fallback below treats "I parsed nothing" as licence to guess
+# from the current directory. For a shim whose contract is *fail closed when it
+# cannot determine the target*, that is the contract inverted. Enumerating
+# spellings can only ever be complete as of the `gh` version last read; this
+# guard closes the class instead of the next instance.
+#
+# Deliberate limits, so the next reader does not overestimate it: it only
+# recognises flags whose SHAPE is already known, so a future target flag spelled
+# some other way still slips past; and the scanners here are positional-naive —
+# no notion of a flag's value, so a literal `--org` appearing as some other
+# flag's argument trips it. That direction fails closed and is recoverable.
+if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; then
+  for a in "$@"; do
+    case "$a" in
+      --) break ;;
+      -o|-o=*|-o?*|--org|--org=*|--owner|--owner=*|-R|-R=*|-R?*|--repo|--repo=*)
+        deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
+        ;;
+    esac
+  done
+fi
+
+if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ] \
+   && [ "$SUBCMD" != "api" ]; then
   REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
   if [ -n "$REMOTE_URL" ]; then
     # Strip trailing /  and .git, then extract OWNER/NAME from the URL tail.
@@ -482,6 +523,13 @@ if [ -n "$TARGET_ORG" ]; then
     exec "$REAL_GH" "$@"
   fi
   deny "$TARGET_ORG" "org '$TARGET_ORG' is not in the allowed list"
+fi
+
+# `--owner @me`: the target is the authenticated identity itself. Nothing to
+# look up against the allowlist, and nothing to infer — allow it explicitly
+# rather than letting it fall through to the cwd-remote guess.
+if [ "$SELF_TARGET" = "1" ]; then
+  exec "$REAL_GH" "$@"
 fi
 
 # No target detected. If this is a `gh api` call to a non-repo path, allow it
