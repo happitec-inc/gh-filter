@@ -13,9 +13,35 @@ export GH_FILTER_NOTIFY=/usr/bin/true
 # The default allowlist is empty (gh-filter loads it from a config file).
 # Write a temp config so the allow-path tests have something to allow against.
 TEST_CONFIG=$(/usr/bin/mktemp -t gh-filter-test-config)
-trap '/bin/rm -f "$TEST_CONFIG"' EXIT
 /bin/echo "ALLOWED_OWNERS=test-allowed-org" > "$TEST_CONFIG"
 export GH_FILTER_CONFIG="$TEST_CONFIG"
+
+# Pin the real-gh side of every call to a stub, for the whole suite.
+#
+# This closes a class, not a case. A BLOCK assertion execs the real binary in
+# exactly the world it exists to detect — the one where the filter fails to
+# block — and eight of them name mutating operations (`issue create`,
+# `pr create`, `repo fork`, `project delete|item-add|item-delete`,
+# `api -X POST .../issues`, `extension install`). Measured: in the pre-PR world
+# all three `project` write verbs came back exit 0, i.e. reached the binary,
+# before the assertion was evaluated. Under CI that is the real `gh`.
+#
+# What saved them until now is that `disallowed-test-owner` and
+# `test-allowed-org` do not exist on GitHub (both 404). That is a real control
+# but an implicit one, and "it did not land because the target was fictional"
+# is the same standard as "it deleted nothing because the token had no user" —
+# luck wearing a control's clothes. The stub makes the class unreachable.
+STUB_REAL_GH=$(/usr/bin/mktemp -t gh-filter-test-stub)
+/bin/cat > "$STUB_REAL_GH" <<'STUB'
+#!/bin/sh
+# Stands in for the real `gh`. Exits 0: allow-path assertions check "not 77",
+# and the `--version`/`--help` pass-through cases assert exit 0 specifically.
+# Nothing this suite runs can reach GitHub.
+exit 0
+STUB
+/bin/chmod +x "$STUB_REAL_GH"
+trap '/bin/rm -f "$TEST_CONFIG" "$STUB_REAL_GH"' EXIT
+export GH_FILTER_REAL_GH="$STUB_REAL_GH"
 
 if [ ! -x "$FILTER" ]; then
   echo "test.sh: ERROR — $FILTER missing or not executable" >&2
@@ -179,11 +205,48 @@ assert_in_allowlisted_checkout "project item-delete -odisallowed"    block proje
 # never appear in an allowlist, so it must be allowed explicitly rather than
 # gated or inferred — otherwise this is the third false-block of this PR.
 assert_allow "project list --owner @me"           project list --owner @me
-# NOTE: `assert_allow` execs the REAL `gh` — the filter passing a call through is
-# the whole point of the assertion. So an allow case must never name a mutating
-# verb. `gh project delete` takes no confirmation flag and deletes immediately.
-# Read-only verbs only here; the mutating verbs are covered by BLOCK cases
-# above, which never reach the real binary.
+
+# --- `search` / `skill search`: --owner is a `strings` (list) flag ----------
+# Receipt: `gh search repos --help` gives `--owner strings   Filter on owner`,
+# and none of the six has an `-o` shorthand. `search issues --owner <org>` is
+# the routine pre-file duplicate scan, so a false block here is expensive.
+assert_allow "search issues --owner allowed"      search issues --owner test-allowed-org is:open
+assert_allow "search repos --owner=allowed"       search repos --owner=test-allowed-org
+assert_allow "skill search --owner allowed"       skill search --owner test-allowed-org
+assert_block "search repos --owner disallowed"    search repos --owner disallowed-test-owner
+assert_block "search code --owner disallowed"     search code --owner disallowed-test-owner foo
+
+# A comma-separated list is legal for a `strings` flag. Every element is gated,
+# so a list mixing an allowlisted owner with a foreign one is blocked and names
+# the offending element — comparing the raw string would have false-blocked the
+# all-allowed case and told you nothing about the mixed one.
+assert_allow "search repos --owner allowed,allowed"    search repos --owner test-allowed-org,test-allowed-org
+assert_block "search repos --owner allowed,disallowed" search repos --owner test-allowed-org,disallowed-test-owner
+
+# `-o` is `--output` on `repo read-file`, which is why `repo` stays out of the
+# org-subcommand list. Guarding `-o` unconditionally reintroduced that exact
+# collision from the other side and false-blocked the canonical use.
+# These must run from an allowlisted checkout: `repo read-file` with no `-R`
+# targets the repo you are standing in, so from the suite's own directory they
+# block on the cwd owner and say nothing about `-o`.
+assert_in_allowlisted_checkout "repo read-file -o out.txt" allow repo read-file -o /dev/null README.md
+assert_in_allowlisted_checkout "repo read-file -oout.txt"  allow repo read-file -o/dev/null README.md
+
+# LAST occurrence wins, matching gh (`gh browse -R a/x -R b/y -n` targets b/y).
+# Breaking on the first match gated these on the harmless value while gh would
+# have targeted the foreign one.
+assert_block "--owner @me then foreign"           project delete 1 --owner @me --owner disallowed-test-owner
+assert_block "--org allowed then foreign"         secret list --org test-allowed-org --org disallowed-test-owner
+assert_block "-R allowed then foreign"            issue list -R test-allowed-org/x -R disallowed-test-owner/y
+# NOTE: an allow case must never name a mutating verb — `assert_allow` passing
+# a call through to `gh` is the whole point of the assertion, and
+# `gh project delete` takes no confirmation flag. Read-only verbs only.
+#
+# The other half of that rule: a BLOCK case execs the binary too, in the world
+# where the filter has regressed — which is the world block cases exist for. Two
+# invariants keep that safe, and both are required: every fixture owner must be
+# one that does not exist on GitHub, and the suite pins GH_FILTER_REAL_GH to a
+# stub (see the top of this file).
 assert_allow "project view --owner=@me"           project view 1 --owner=@me --format json
 
 assert_block "api /repos/disallowed/X"            api /repos/disallowed-test-owner/test-repo
@@ -302,7 +365,11 @@ fi
 
 # Control on the guard's blast radius: ordinary argv in the same fixture must
 # still pass through. A guard that blocks everything would satisfy the
-# assertion above while breaking every real call.
+# assertion above while breaking every real call. One row of bare argv is not
+# enough — it cannot tell "does not fire on ordinary argv" from "fires on any
+# argv carrying a guarded shape", which is what happened when `-o` was guarded
+# unconditionally. The allow cases for `search --owner <allowed>` and
+# `repo read-file -o` above are the rest of this control.
 TMP=$(/usr/bin/mktemp -d)
 (
   cd "$TMP"
@@ -334,6 +401,24 @@ else
   FAIL=$((FAIL+1))
   echo "FAIL: missing config — expected exit 77, got $ec"
 fi
+
+# The unconfigured section used to exercise only `issue list --repo any/repo`
+# in all three of its config variants, so it could not see a new path that
+# skipped the empty-allowlist deny. `--org @me` is exactly that path: it takes
+# neither the TARGET_REPO nor the TARGET_ORG gate, and when it was introduced
+# it exec'd unconditionally. "No allowlist" means the shim is not set up, and
+# the answer to every call in that state is no — including one targeting the
+# caller itself.
+for selfarg in "--org @me" "--owner @me" "--owner=@me"; do
+  # shellcheck disable=SC2086
+  GH_FILTER_CONFIG="$NONEXISTENT" "$FILTER" secret list $selfarg >/dev/null 2>&1
+  ec=$?
+  if [ "$ec" = "77" ]; then
+    PASS=$((PASS+1)); echo "PASS: no allowlist + $selfarg → exit 77 (self-target still gated)"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: no allowlist + $selfarg — expected 77, got $ec"
+  fi
+done
 
 # Empty config file (no ALLOWED_OWNERS line). Same expectation.
 EMPTY_CONFIG=$(/usr/bin/mktemp -t gh-filter-empty-config)
