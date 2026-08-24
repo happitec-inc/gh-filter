@@ -223,6 +223,23 @@ assert_block "search code --owner disallowed"     search code --owner disallowed
 assert_allow "search repos --owner allowed,allowed"    search repos --owner test-allowed-org,test-allowed-org
 assert_block "search repos --owner allowed,disallowed" search repos --owner test-allowed-org,disallowed-test-owner
 
+# --repo is the same `strings` list on the same commands. This block case is
+# the discriminating one of the pair: with the raw string compared, `%%/*`
+# yields the FIRST element's owner, so `<allowed>/x,<foreign>/y` was ALLOWED
+# while the same call without a comma blocked. (The --owner block case above
+# cannot discriminate — a raw comma-joined string matches no allowlist entry,
+# so it blocks either way. Only its allow twin proves the split runs.)
+assert_block "search --repo allowed/x,disallowed/y" search code --repo test-allowed-org/x,disallowed-test-owner/y foo
+assert_allow "search --repo allowed/x,allowed/y"    search code --repo test-allowed-org/x,test-allowed-org/y foo
+assert_allow "--owner allowed, (trailing comma)"    search repos --owner test-allowed-org,
+
+# A value that yields NO elements must deny, not fall through. The first
+# version of the split put `deny` inside the loop and `exec` after it, so an
+# empty loop reached the exec: measured ALLOW. A gate whose safe answer depends
+# on its loop body running is not a gate.
+assert_block "--org , (separators only)"            secret set FOO --org , -R disallowed-test-owner/x
+assert_block "--org ,, (separators only)"           secret list --org ,,
+
 # `-o` is `--output` on `repo read-file`, which is why `repo` stays out of the
 # org-subcommand list. Guarding `-o` unconditionally reintroduced that exact
 # collision from the other side and false-blocked the canonical use.
@@ -339,6 +356,24 @@ if [ "$ec" != "77" ]; then
   PASS=$((PASS+1)); echo "PASS: git-remote allowed-owner detected → passed through (exit $ec)"
 else
   FAIL=$((FAIL+1)); echo "FAIL: git-remote allowed-owner blocked"
+fi
+/bin/rm -rf "$TMP"
+
+# Pathname expansion must not reach the allow decision. The split was unquoted
+# with globbing live, so `--org '*'` expanded against the CURRENT DIRECTORY —
+# and a directory holding a file named after an allowlisted owner became an
+# allow. Filesystem contents are not an input to this gate.
+TMP=$(/usr/bin/mktemp -d)
+: > "$TMP/test-allowed-org"
+(
+  cd "$TMP"
+  "$FILTER" secret list --org '*' >/dev/null 2>&1
+)
+ec=$?
+if [ "$ec" = "77" ]; then
+  PASS=$((PASS+1)); echo "PASS: --org '*' in a dir holding an allowlisted-owner filename → blocked"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: --org '*' expanded against the cwd (exit $ec)"
 fi
 /bin/rm -rf "$TMP"
 
