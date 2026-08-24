@@ -183,7 +183,7 @@ assert_allow "attestation verify --owner=allowed"    attestation verify --owner=
 assert_block "attestation verify --owner disallowed" attestation verify --owner disallowed-test-owner /nonexistent-subject
 assert_block "attestation verify --owner=disallowed" attestation verify --owner=disallowed-test-owner /nonexistent-subject
 
-# --- `gh project`: --owner on 19 subcommands, 11 of them writes -------------
+# --- `gh project`: --owner on 19 subcommands, 15 of them writes -------------
 # Receipt: `gh project item-add --help` documents
 #   `--owner string   Login of the owner. Use "@me" for the current user.`
 # `project` was absent from ORG_SUBCMD, so --owner went unparsed and the
