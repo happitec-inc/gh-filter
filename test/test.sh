@@ -230,6 +230,10 @@ assert_block "search repos --owner allowed,disallowed" search repos --owner test
 # cannot discriminate — a raw comma-joined string matches no allowlist entry,
 # so it blocks either way. Only its allow twin proves the split runs.)
 assert_block "search --repo allowed/x,disallowed/y" search code --repo test-allowed-org/x,disallowed-test-owner/y foo
+# Twin of the case above, and NOT a discriminator: raw comparison takes the
+# first element's owner, which is allowlisted here, so this passes with or
+# without the split. Kept as the blast-radius half of the pair — it is what
+# would go red if the split ever over-refused an all-allowed list.
 assert_allow "search --repo allowed/x,allowed/y"    search code --repo test-allowed-org/x,test-allowed-org/y foo
 assert_allow "--owner allowed, (trailing comma)"    search repos --owner test-allowed-org,
 
