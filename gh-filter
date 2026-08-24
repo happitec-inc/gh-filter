@@ -466,6 +466,7 @@ case "$SUBCMD" in
   *) ORG_SUBCMD=0 ;;
 esac
 SELF_TARGET=0
+COPY_OWNERS=""
 if [ "$ORG_SUBCMD" = "1" ]; then
   i=0
   args=("$@")
@@ -499,6 +500,25 @@ if [ "$ORG_SUBCMD" = "1" ]; then
         if [ "$v" = "@me" ]; then SELF_TARGET=1; TARGET_ORG=""
         else TARGET_ORG="$v"; SELF_TARGET=0; fi
         ;;
+      # `gh project copy` does not take `--owner` at all. It takes
+      # `--source-owner` (what you read) and `--target-owner` (where the copy
+      # lands) — receipt: `gh project copy --help`. Neither was parsed, so a
+      # project copy INTO a foreign org was decided by the cwd remote. Both are
+      # real targets, so both are accumulated and every one must be allowed;
+      # they are appended rather than last-wins, because they name different
+      # things and coexist in one invocation.
+      --source-owner|--target-owner)
+        if [ $((i+1)) -lt ${#args[@]} ]; then
+          v="${args[$((i+1))]}"
+          if [ "$v" = "@me" ]; then SELF_TARGET=1
+          else COPY_OWNERS="${COPY_OWNERS:+$COPY_OWNERS,}$v"; fi
+        fi
+        ;;
+      --source-owner=*|--target-owner=*)
+        v="${a#*=}"
+        if [ "$v" = "@me" ]; then SELF_TARGET=1
+        else COPY_OWNERS="${COPY_OWNERS:+$COPY_OWNERS,}$v"; fi
+        ;;
       # Attached shorthand `-oORG`. gh accepts it and routes it to the org;
       # recognising only the space-separated form left TARGET_ORG empty, so the
       # cwd-remote fallback decided the verdict — from any allowlisted checkout
@@ -511,6 +531,14 @@ if [ "$ORG_SUBCMD" = "1" ]; then
     esac
     i=$((i+1))
   done
+  # An explicit owner named by --source-owner/--target-owner outranks nothing
+  # else here (project copy has no other owner flag), but if BOTH a plain
+  # --owner and a copy owner somehow appear, every named owner still has to
+  # pass — so join rather than choose.
+  if [ -n "$COPY_OWNERS" ]; then
+    TARGET_ORG="${TARGET_ORG:+$TARGET_ORG,}$COPY_OWNERS"
+    SELF_TARGET=0
+  fi
 fi
 
 # 2. `gh api`: extract /repos/OWNER/NAME from a path arg.
@@ -576,7 +604,7 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; t
           deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         fi
         ;;
-      --org|--org=*|--owner|--owner=*|-R|-R=*|-R?*|--repo|--repo=*)
+      --org|--org=*|--owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|-R|-R=*|-R?*|--repo|--repo=*)
         deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         ;;
     esac

@@ -206,6 +206,19 @@ assert_in_allowlisted_checkout "project item-delete -odisallowed"    block proje
 # gated or inferred — otherwise this is the third false-block of this PR.
 assert_allow "project list --owner @me"           project list --owner @me
 
+# `gh project copy` takes NO `--owner`. Receipt: `gh project copy --help` gives
+# `--source-owner` (what is read) and `--target-owner` (where the copy lands).
+# Neither was parsed, so a project copy INTO a foreign org was decided by the
+# cwd remote. Both are real targets; every named owner must pass. These run
+# from an allowlisted checkout because that is the only configuration in which
+# the laundering reproduces.
+assert_in_allowlisted_checkout "project copy --target-owner disallowed"  block project copy 1 --target-owner disallowed-test-owner
+assert_in_allowlisted_checkout "project copy --source-owner disallowed"  block project copy 1 --source-owner disallowed-test-owner
+assert_in_allowlisted_checkout "project copy --target-owner=disallowed"  block project copy 1 --target-owner=disallowed-test-owner
+assert_in_allowlisted_checkout "project copy allowed->disallowed"        block project copy 1 --source-owner test-allowed-org --target-owner disallowed-test-owner
+assert_in_allowlisted_checkout "project copy allowed->allowed"           allow project copy 1 --source-owner test-allowed-org --target-owner test-allowed-org
+assert_in_allowlisted_checkout "project copy --target-owner @me"         allow project copy 1 --target-owner @me
+
 # --- `search` / `skill search`: --owner is a `strings` (list) flag ----------
 # Receipt: `gh search repos --help` gives `--owner strings   Filter on owner`,
 # and none of the six has an `-o` shorthand. `search issues --owner <org>` is

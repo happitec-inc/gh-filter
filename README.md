@@ -92,7 +92,7 @@ Target detection sources, in order:
 Two properties of that list are worth stating plainly, because they are the difference between a gate and a guess:
 
 - **An explicit flag beats the git-remote fallback.** Step 5 infers a target from wherever the process happens to be standing. Steps 1–4 determine one from the arguments. If argv names a target, the fallback is not consulted — otherwise `gh secret set --org some-org`, run from inside an unrelated checkout, would be gated on *that checkout's* owner rather than on the org being addressed.
-- **The scanners are positional-naive.** They walk argv word by word, with no `--` end-of-options handling and no notion of which words are a flag's *value* rather than a flag. This is why the guard below errs toward refusing.
+- **The scanners are positional-naive.** They walk argv word by word with no notion of which words are a flag's *value* rather than a flag, so a literal `--org` passed as some other flag's argument is read as a target. This is why the guard below errs toward refusing. (The guard itself does stop at `--`: `gh issue list -- --owner some-org` is not treated as naming a target.)
 
 If no target can be determined and the subcommand isn't a recognized no-repo operation (`auth status`, `--version`, `api /user`, etc.), the call is refused with a suggestion to pass `--repo` explicitly.
 
@@ -107,6 +107,13 @@ The org is gated through the same allowlist as a repo owner. This widens the arg
 `--org` / `--owner` / `-o` is treated as the target only for subcommands where it genuinely *is* the target:
 
 `secret` · `variable` · `ruleset` · `codespace` · `attestation` · `project` · `search` · `skill`
+
+`gh project` is not uniform, and the difference matters: 16 of its subcommands take `--owner`, two (`field-delete`, `item-edit`) take no owner flag at all, and **`copy` takes neither — it takes `--source-owner` and `--target-owner`**. Both of those are gated, and *both* must be allowlisted, since a copy reads from one org and writes to another:
+
+```bash
+gh project copy 1 --source-owner your-org --target-owner another-org      # allowed if both are
+gh project copy 1 --source-owner your-org --target-owner some-other-org   # BLOCKED on the target
+```
 
 `repo` is deliberately **excluded**. Two reasons, both load-bearing:
 
@@ -145,7 +152,9 @@ gh secret list --org ,                             # blocked: no owner parsed
 
 ### `--owner @me`
 
-`@me` is documented and legal on every `gh project` subcommand. It names the **authenticated identity**, not a third party, so it is neither an org to look up nor a target to infer — it is allowed explicitly:
+`@me` is legal on the `gh project` subcommands that take an owner flag — `gh project item-add --help` documents `--owner string   Login of the owner. Use "@me" for the current user.` Not all of them spell it out (`list` and `mark-template` do not, and `field-delete` / `item-edit` have no owner flag at all), so treat the receipt as covering the flag, not all 19 subcommands.
+
+It names the **authenticated identity**, not a third party, so it is neither an org to look up nor a target to infer — it is allowed explicitly:
 
 ```bash
 gh project list --owner @me                        # allowed
@@ -176,7 +185,14 @@ Reason:          argv names a target via '--owner' that this filter did not pars
 
 **Why this exists.** Five separate argv spellings were added to the parser in five separate fixes, and *every* miss failed **open** — an unrecognised target flag left the target empty, and the fallback treated "I parsed nothing" as licence to guess from the current directory. For a shim whose contract is *fail closed when it cannot determine the target*, that is the contract inverted. Enumerating spellings can only ever be complete as of the `gh` version last read; this closes the class rather than the next instance.
 
-**What it means for you.** If you see this block on a call you believe is legitimate, the filter is telling you it does not understand that flag on that subcommand — not that the owner is disallowed. Either name the target a way it does parse (`--repo OWNER/NAME`), or file an issue so the subcommand is handled properly.
+**It fires only when nothing else resolved a target.** This is a last-resort check sitting in front of the git-remote fallback, not a scan of every invocation. If some earlier step already determined a target, that target is gated and the guard never runs:
+
+```bash
+gh issue list --owner some-other-org                    # BLOCKED by the guard
+gh issue list --repo your-org/x --owner some-other-org  # allowed — gated on your-org/x
+```
+
+**So do not treat "add `--repo`" as the remedy.** Adding a `--repo` you control silences the guard by giving the filter a target it *can* parse, which converts a refusal into a pass-through without anyone having examined the flag it could not read. If this block fires on a call you believe is legitimate, the filter is telling you it does not understand that flag on that subcommand — not that the owner is disallowed. **File an issue so the subcommand is handled properly.**
 
 **Its limits, stated rather than implied:** it recognises only flag shapes already known, so a future target flag spelled some other way still slips past; and because the scanners are positional-naive, a literal `--org` appearing as some *other* flag's value will trip it. That direction fails closed and is recoverable.
 
