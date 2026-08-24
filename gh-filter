@@ -508,6 +508,7 @@ case "$SUBCMD" in
 esac
 SELF_TARGET=0
 EXTRA_OWNERS=""
+CONSUMED_ORG_FLAG=0
 if [ "$ORG_SUBCMD" = "1" ]; then
   i=0
   args=("$@")
@@ -534,12 +535,13 @@ if [ "$ORG_SUBCMD" = "1" ]; then
           else
             TARGET_ORG="${args[$((i+1))]}"; SELF_TARGET=0
           fi
+          CONSUMED_ORG_FLAG=1
         fi
         ;;
       --org=*|--owner=*|-o=*)
         v="${a#*=}"
         if [ "$v" = "@me" ]; then SELF_TARGET=1; TARGET_ORG=""
-        else TARGET_ORG="$v"; SELF_TARGET=0; fi
+        else TARGET_ORG="$v"; SELF_TARGET=0; fi; CONSUMED_ORG_FLAG=1
         ;;
       # `gh project copy` does not take `--owner` at all. It takes
       # `--source-owner` (what you read) and `--target-owner` (where the copy
@@ -565,7 +567,7 @@ if [ "$ORG_SUBCMD" = "1" ]; then
             *)     v=$(team_owner "${a#-T}") ;;
           esac
           if [ "$v" = "@me" ]; then SELF_TARGET=1
-          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi
         fi
         ;;
       # `--repo-owner` is the codespace tree's owner target (11 subcommands).
@@ -575,13 +577,13 @@ if [ "$ORG_SUBCMD" = "1" ]; then
         if [ $((i+1)) -lt ${#args[@]} ]; then
           v="${args[$((i+1))]}"
           if [ "$v" = "@me" ]; then SELF_TARGET=1
-          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi
         fi
         ;;
       --repo-owner=*)
         v="${a#--repo-owner=}"
         if [ "$v" = "@me" ]; then SELF_TARGET=1
-        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi
         ;;
       # `gh search issues|prs --project owner/number` names an owner too. Only
       # under `search`: `--project` elsewhere is a project NAME, not owner/N.
@@ -594,7 +596,7 @@ if [ "$ORG_SUBCMD" = "1" ]; then
           case "$v" in
             */*) v="${v%%/*}"
                  if [ "$v" = "@me" ]; then SELF_TARGET=1
-                 elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi ;;
+                 elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi ;;
           esac
         fi
         ;;
@@ -602,25 +604,25 @@ if [ "$ORG_SUBCMD" = "1" ]; then
         if [ $((i+1)) -lt ${#args[@]} ]; then
           v=$(team_owner "${args[$((i+1))]}")
           if [ "$v" = "@me" ]; then SELF_TARGET=1
-          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+          elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi
         fi
         ;;
       --team=*)
         v=$(team_owner "${a#*=}")
         if [ "$v" = "@me" ]; then SELF_TARGET=1
-        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        elif [ -n "$v" ]; then EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi
         ;;
       --source-owner|--target-owner)
         if [ $((i+1)) -lt ${#args[@]} ]; then
           v="${args[$((i+1))]}"
           if [ "$v" = "@me" ]; then SELF_TARGET=1
-          else EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+          else EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi
         fi
         ;;
       --source-owner=*|--target-owner=*)
         v="${a#*=}"
         if [ "$v" = "@me" ]; then SELF_TARGET=1
-        else EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; fi
+        else EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1; fi
         ;;
       # Attached shorthand `-oORG`. gh accepts it and routes it to the org;
       # recognising only the space-separated form left TARGET_ORG empty, so the
@@ -629,7 +631,7 @@ if [ "$ORG_SUBCMD" = "1" ]; then
       -o?*)
         v="${a#-o}"
         if [ "$v" = "@me" ]; then SELF_TARGET=1; TARGET_ORG=""
-        else TARGET_ORG="$v"; SELF_TARGET=0; fi
+        else TARGET_ORG="$v"; SELF_TARGET=0; fi; CONSUMED_ORG_FLAG=1
         ;;
     esac
     i=$((i+1))
@@ -650,52 +652,45 @@ while [ $i -lt ${#args2[@]} ]; do
     --branch-repo)
       if [ $((i+1)) -lt ${#args2[@]} ]; then
         v=$(repo_ref_owner "${args2[$((i+1))]}")
-        [ -n "$v" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+        [ -n "$v" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1
       fi
       ;;
     --branch-repo=*)
       v=$(repo_ref_owner "${a#--branch-repo=}")
-      [ -n "$v" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+      [ -n "$v" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1
       ;;
     # `gh search --team-mentions OWNER/TEAM` names an owner the same way
     # --team does.
     --team-mentions)
       if [ $((i+1)) -lt ${#args2[@]} ]; then
         v=$(team_owner "${args2[$((i+1))]}")
-        [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+        [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1
       fi
       ;;
     --team-mentions=*)
       v=$(team_owner "${a#--team-mentions=}")
-      [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+      [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1
       ;;
     # `gh repo fork <upstream> --org X` WRITES the fork into X. Round 2
     # established that treating --org as THE target would let
     # `repo fork <foreign>/x --org <allowed>` through, so `repo` stays out of
     # the org-subcommand list — but the destination is still a write target.
     # Gating it as an ADDITIONAL owner keeps both ends checked.
-    --org|-o|--org=*|-o=*)
+    # `gh repo fork` has NO -o shorthand — receipt: `--org string`, no
+    # shorthand listed. Matching -o here asserted on argv gh rejects.
+    --org|--org=*)
       if [ "$SUBCMD" = "repo" ] && [ "${2:-}" = "fork" ]; then
         case "$a" in
-          --org|-o) if [ $((i+1)) -lt ${#args2[@]} ]; then v="${args2[$((i+1))]}"; else v=""; fi ;;
+          --org) if [ $((i+1)) -lt ${#args2[@]} ]; then v="${args2[$((i+1))]}"; else v=""; fi ;;
           *)        v="${a#*=}" ;;
         esac
-        [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"
+        [ -n "$v" ] && [ "$v" != "@me" ] && EXTRA_OWNERS="${EXTRA_OWNERS:+$EXTRA_OWNERS,}$v"; CONSUMED_ORG_FLAG=1
+        CONSUMED_ORG_FLAG=1
       fi
       ;;
   esac
   i=$((i+1))
 done
-
-# Fold every additionally-named owner into the org target — AFTER BOTH scans.
-# Folding after the first scan only meant a flag parsed by the SECOND scan
-# never reached the gate, so the guard refused it instead. Measured as three
-# false blocks: `issue develop --branch-repo <allowed>/x`, the same with a
-# bare branch-repo name, and `search --team-mentions <allowed>/eng`.
-if [ -n "$EXTRA_OWNERS" ]; then
-  TARGET_ORG="${TARGET_ORG:+$TARGET_ORG,}$EXTRA_OWNERS"
-  SELF_TARGET=0
-fi
 
 # 2. `gh api`: extract /repos/OWNER/NAME from a path arg.
 if [ -z "$TARGET_REPO" ] && [ "$SUBCMD" = "api" ]; then
@@ -758,17 +753,17 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; t
       # `-T` is `--template` on issue/pr create, so it is guarded only where it
       # means a team; `--project` is a project NAME outside `search`.
       -T|-T=*|-T?*)
-        if [ "$SUBCMD" = "project" ]; then
+        if [ "$SUBCMD" = "project" ] && [ "$CONSUMED_ORG_FLAG" != "1" ]; then
           deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         fi
         ;;
       --project|--project=*)
-        if [ "$SUBCMD" = "search" ]; then
+        if [ "$SUBCMD" = "search" ] && [ "$CONSUMED_ORG_FLAG" != "1" ]; then
           deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         fi
         ;;
       -o|-o=*|-o?*)
-        if [ "$ORG_SUBCMD" = "1" ]; then
+        if [ "$ORG_SUBCMD" = "1" ] && [ "$CONSUMED_ORG_FLAG" != "1" ]; then
           deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         fi
         ;;
@@ -777,7 +772,27 @@ if [ -z "$TARGET_REPO" ] && [ -z "$TARGET_ORG" ] && [ "$SELF_TARGET" != "1" ]; t
       # flag we do parse turns a legitimately owner-less value into a block —
       # measured: `issue develop --branch-repo <bare-name>`, which names a repo
       # under the CURRENT owner, was refused.
-      --org|--org=*|--owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|--team|--team=*|--repo-owner|--repo-owner=*|-R|-R=*|-R?*|--repo|--repo=*)
+      # A flag the scans already consumed is not "unparsed". `gh repo fork
+      # --org X` with no positional forks the CURRENT repo into X — legal, and
+      # refused here until the scan recorded that it had read the flag.
+      --org|--org=*)
+        if [ "$CONSUMED_ORG_FLAG" != "1" ]; then
+          deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
+        fi
+        ;;
+      # Same rule as --org above: a flag a scan already consumed is not
+      # "unparsed". Measured five false blocks at once when this was missing —
+      # `project copy <allowed>-><allowed>`, `project link --team <allowed>/x`
+      # in both forms, `codespace --repo-owner <allowed>`, and
+      # `search --project <allowed>/N`.
+      --owner|--owner=*|--source-owner|--source-owner=*|--target-owner|--target-owner=*|--team|--team=*|--repo-owner|--repo-owner=*)
+        if [ "$CONSUMED_ORG_FLAG" != "1" ]; then
+          deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
+        fi
+        ;;
+      # --repo/-R stay unconditional: step 1 always parses them, so reaching
+      # here means the value was absent or unreadable.
+      -R|-R=*|-R?*|--repo|--repo=*)
         deny "<unparsed target flag: $a>" "argv names a target via '$a' that this filter did not parse; refusing to infer the target from the current directory"
         ;;
     esac
@@ -811,6 +826,22 @@ if [ "$ORG_SUBCMD" = "1" ] && [ -n "$TARGET_ORG" ] && [ -n "$TARGET_REPO" ]; the
   TARGET_REPO=""
 fi
 
+# Owners named by a NON-target flag are an ADDITIONAL constraint, never a
+# substitute for target detection. Folding them into TARGET_ORG made a
+# non-empty value suppress both the guard and the cwd-remote fallback, so
+# `issue develop --branch-repo <allowed>/x` run from a FOREIGN checkout went
+# from BLOCK to ALLOW — round 2's error in a new place: an additional owner
+# promoted to the target. They are checked here and detection continues
+# untouched.
+if [ -n "$EXTRA_OWNERS" ]; then
+  if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
+    deny "$EXTRA_OWNERS" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
+  fi
+  if ! DENY_REASON=$(all_elements_allowed "$EXTRA_OWNERS" org); then
+    deny "$EXTRA_OWNERS" "$DENY_REASON"
+  fi
+fi
+
 if [ -n "$TARGET_REPO" ]; then
   if [ "${#ALLOWED_OWNERS[@]}" -eq 0 ]; then
     deny "$TARGET_REPO" "no allowlist configured; create $GH_FILTER_CONFIG with ALLOWED_OWNERS=owner1,owner2,..."
@@ -821,14 +852,6 @@ if [ -n "$TARGET_REPO" ]; then
   # without the comma blocked.
   if ! DENY_REASON=$(all_elements_allowed "$TARGET_REPO" repo); then
     deny "$TARGET_REPO" "$DENY_REASON"
-  fi
-  # A repo target does not license every OTHER owner named in the same call —
-  # `repo fork <allowed>/x --org <foreign>` writes the fork INTO the foreign
-  # org while the positional passes. Every named owner is checked.
-  if [ -n "$EXTRA_OWNERS" ]; then
-    if ! DENY_REASON=$(all_elements_allowed "$EXTRA_OWNERS" org); then
-      deny "$EXTRA_OWNERS" "$DENY_REASON"
-    fi
   fi
   exec "$REAL_GH" "$@"
 fi
