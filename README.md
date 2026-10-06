@@ -272,6 +272,74 @@ Identity selection and the owner-allowlist are separate stages, and the allowlis
 
 The identity stage runs `AGENT_TOKEN_COMMAND` on every agent-context call, **with no caching**. If your command performs a network round-trip (e.g. minting an installation token), every agent `gh` call pays that latency. Caching is intentionally not built in yet; wrap your command with your own cache if the cost matters.
 
+## Mention guard (optional)
+
+When automated agents post to GitHub under names of their own, those names leak into prose: "thanks @reviewer-bot for the catch". If an agent name is **also a real GitHub login**, that `@` notifies a stranger. The mention guard refuses any write whose body `@`-mentions a name from a registry you supply.
+
+It is a **courtesy guard, not a security boundary**, and behaves like one:
+
+- **Off unless configured.** With no registry set, it does nothing.
+- **Fails open.** A missing, unreadable or malformed registry (or no `jq`) prints a warning to stderr and lets the call through.
+- **Does not page.** A refusal goes to the caller only; no `notify` alert. The caller fixes the wording and retries.
+- **Read-only.** It reads the registry on every call and never writes it.
+
+### Configuration
+
+```
+MENTION_GUARD_REGISTRY=/path/to/agents.json   # names that must not be @-mentioned
+MENTION_GUARD_ALLOW=your-handle               # optional: handles that are always allowed
+```
+
+The registry is a JSON array of names, either bare strings or objects with a `"name"` field (other fields and entries without a name are ignored):
+
+```json
+[{"name": "reviewer-bot", "dir": "/srv/agents/reviewer"}, "deploy-bot"]
+```
+
+`MENTION_GUARD_ALLOW` is a comma-separated list of handles exempted even if they appear in the registry, typically the human operator's own handle. Both keys can be overridden with `GH_FILTER_MENTION_GUARD_REGISTRY` / `GH_FILTER_MENTION_GUARD_ALLOW`. Reading the registry needs `jq` (`/usr/bin/jq` ships with macOS 15 and later; otherwise it's looked up on `PATH`).
+
+### What is scanned
+
+| Command | Body sources |
+|---|---|
+| `issue create` / `new`, `issue comment`, `issue edit` | `-b`/`--body`, `-F`/`--body-file` (a file, or `-` for stdin) |
+| `pr create` / `new`, `pr comment`, `pr edit`, `pr review` | same |
+| `issue close`, `issue reopen`, `pr close`, `pr reopen` | `-c`/`--comment` |
+| `api` | `-f`/`--raw-field` and `-F`/`--field` whose key is `body` or ends in `[body]` (e.g. `comments[][body]`); `-F body=@file` and `-F body=@-` are read |
+
+All spellings are recognised (`--body X`, `--body=X`, `-b X`, `-bX`, `-b=X`, and the same for the other flags), including `-R`/`--repo` placed before the verb (`gh pr -R owner/repo comment 1 -b ...`) or before the command group (`gh -R owner/repo pr comment 1 -b ...`). When the body comes from stdin, the filter reads it, scans it, and hands the same bytes to the real `gh`.
+
+### Matching
+
+- **Case-insensitive, whole token.** `@Reviewer-Bot` matches `reviewer-bot`; `@reviewer-bot2` and `@reviewer-bots` do not.
+- **Not a mention:** `x@name` (an `@` preceded by a letter or digit, as in an email address).
+- **Not scanned:** text in inline code spans (`` `@name` ``) and fenced code blocks (```` ``` ```` or `~~~`). GitHub does not notify for those, so backticks are the fix. A code span can't cross a paragraph boundary, so a stray backtick in one paragraph or list item doesn't hide a mention in the next.
+
+  Some lines that look like block starts (a bullet, an ordered-list marker, a heading, a blockquote) don't always end the paragraph. For example, `2.` can't interrupt a paragraph, and GitHub keeps a span across it. Telling those cases apart needs list context, so the guard pairs backticks two ways: once breaking only at blank lines, and once also breaking at every such line. A mention passes only if both readings put it inside code. When the guard is wrong, it refuses, and backticks around the name fix the refusal. CRLF line endings are handled.
+
+### Refusal
+
+Exit `77`, nothing reaches `gh`, and stderr names each offending mention with replacement wording:
+
+```
+gh-filter: REFUSED — body @-mentions an agent name
+...
+Write the name without the @-mention instead, for example:
+    `reviewer-bot`   or   the reviewer-bot agent
+```
+
+### Known gaps
+
+- `pr create --fill` / `--fill-first` / `--fill-verbose` take the body from commit messages, and `-T`/`--template` from a template file; neither is scanned.
+- `api --input` (a raw request body) is not scanned, and neither are fields other than `body`.
+- Other writes that notify (`release create --notes`, commit messages) are not covered.
+- Indentation is not interpreted. A line indented 4 or more spaces is scanned like any other line of its paragraph, so:
+  - an `@name` inside an indented code block is **refused**, though GitHub would not notify (backticks fix it);
+  - backticks on indented lines still pair as code spans within a paragraph, so a mention between two indented ```` ``` ```` lines is **not** refused, though GitHub would notify. This is contrived; it is documented rather than fixed because handling indented code properly needs list context (indented text under a list item is a paragraph and does notify).
+- Registry names are matched against `[A-Za-z0-9-]` tokens, the characters a GitHub login can contain. A registry name with any other character (for example `example.com` or `my_bot`) can never match and is effectively ignored. Such a name cannot be a GitHub login, so nobody can be notified through it.
+- Bodies written in an editor (`-e`/`--editor`) or entered at an interactive prompt are not scanned.
+- Like everything here, it only sees `gh`. A raw `curl` to the API bypasses it.
+
 ## Subcommands always passed through (no repo check)
 
 - `--version`, `--help`, `-v`, `-h`
@@ -311,6 +379,8 @@ The config file holds `KEY=VALUE` lines. Recognized keys:
 | `ALLOWED_OWNERS`      | Comma-separated owner allowlist (required for repo-targeted calls)      |
 | `AGENT_TOKEN_COMMAND` | Optional. Command whose stdout is the token to inject for agent calls   |
 | `AGENT_MARKER_ENVS`   | Optional. Comma-separated env-var names marking an agent context        |
+| `MENTION_GUARD_REGISTRY` | Optional. JSON registry of names that must not be `@`-mentioned in bodies |
+| `MENTION_GUARD_ALLOW` | Optional. Comma-separated handles always allowed by the mention guard   |
 
 The script also reads these environment variables at runtime (each overrides the corresponding config key or default):
 
@@ -321,6 +391,9 @@ The script also reads these environment variables at runtime (each overrides the
 | `GH_FILTER_NOTIFY`                | resolved from `$PATH` via `command -v notify`        | Path to the `notify` binary (Pushover)        |
 | `GH_FILTER_AGENT_TOKEN_COMMAND`   | value of `AGENT_TOKEN_COMMAND` in config             | Override the agent token command              |
 | `GH_FILTER_AGENT_MARKER_ENVS`     | value of `AGENT_MARKER_ENVS` in config               | Override the agent marker env list            |
+| `GH_FILTER_MENTION_GUARD_REGISTRY` | value of `MENTION_GUARD_REGISTRY` in config         | Override the mention-guard registry path      |
+| `GH_FILTER_MENTION_GUARD_ALLOW`   | value of `MENTION_GUARD_ALLOW` in config             | Override the mention-guard exempt handles     |
+| `GH_FILTER_JQ`                    | `/usr/bin/jq`, else `jq` on `$PATH`                  | `jq` used to read the mention-guard registry; anything but an absolute path to an executable file means "no jq" (fails open) |
 
 If `notify` isn't installed or isn't found, the filter silently skips the Pushover alert and still blocks the call. The phone alert is best-effort, not a precondition for enforcement.
 
@@ -342,7 +415,7 @@ The block message reminds operators that these are **separate, escalated violati
 | `0`  | Real `gh` ran and succeeded                   |
 | `1`+ | Real `gh` ran and exited with that code       |
 | `70` | gh-filter: real `gh` binary not found         |
-| `77` | gh-filter: invocation blocked by the filter   |
+| `77` | gh-filter: invocation blocked by the filter (owner allowlist, or the mention guard) |
 | `78` | gh-filter: agent identity could not be resolved (fail-closed) |
 
 ## The Pushover notification

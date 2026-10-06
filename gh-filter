@@ -80,6 +80,18 @@ if [ -n "$_marker_raw" ]; then
   done
 fi
 
+# Optional @-mention guard (see README §"Mention guard"). Two keys, same file,
+# same env-override convention:
+#
+#   MENTION_GUARD_REGISTRY=/path/to/names.json   (GH_FILTER_MENTION_GUARD_REGISTRY)
+#   MENTION_GUARD_ALLOW=handle1,handle2          (GH_FILTER_MENTION_GUARD_ALLOW)
+#
+# The registry lists names that must never be @-mentioned in a GitHub body
+# because they are agent names, not people — and an agent name that is also a
+# real GitHub login notifies that stranger. Unset → the guard is a no-op.
+MENTION_GUARD_REGISTRY="${GH_FILTER_MENTION_GUARD_REGISTRY:-$(_read_cfg_scalar MENTION_GUARD_REGISTRY)}"
+MENTION_GUARD_ALLOW="${GH_FILTER_MENTION_GUARD_ALLOW:-$(_read_cfg_scalar MENTION_GUARD_ALLOW)}"
+
 # Resolve the `notify` binary for Pushover alerts. Default: PATH lookup.
 # Override with GH_FILTER_NOTIFY if notify lives outside PATH.
 NOTIFY="${GH_FILTER_NOTIFY:-$(command -v notify 2>/dev/null)}"
@@ -416,6 +428,400 @@ if [ "$SUBCMD" = "api" ]; then
     fi
   done
 fi
+
+# ---- @-mention guard ----------------------------------------------------------
+#
+# Refuses a write whose BODY @-mentions a name from MENTION_GUARD_REGISTRY. This
+# is a courtesy guard, not a security boundary, and it is built that way on
+# purpose:
+#
+#   - It FAILS OPEN. A missing, unreadable or unparseable registry prints a
+#     warning and lets the call through; it never blocks `gh`.
+#   - It does NOT page the operator. The caller fixes the wording and retries;
+#     a phone alert per typo would be noise.
+#   - It only reads the registry. It never writes it.
+#
+# Scope, with receipts from `gh <cmd> --help` (gh 2.102.0):
+#   issue create|new|comment|edit, pr create|new|comment|edit|review
+#     -b, --body string / -F, --body-file file (use "-" to read from stdin)
+#   api
+#     -f, --raw-field key=value   always a literal string
+#     -F, --field key=value       `@<path>` / `@-` read the value from file/stdin
+#   For `api`, only fields named `body` (or ending `[body]`, e.g.
+#   `comments[][body]`) are scanned.
+#
+# Not scanned (documented as known gaps in the README): `pr create --fill*`
+# (body comes from commit messages), `-T/--template`, `api --input`, release
+# notes, and any write that does not go through `gh`.
+
+# The awk program that decides. stdin = one body; -v names/allow = comma lists.
+# Prints each offending name (lowercased) once.
+#
+# What does NOT count as a mention, because GitHub does not notify for it:
+#   - text inside a fenced code block (``` or ~~~, up to 3 spaces of indent,
+#     closed by the same fence char at least as long; an unclosed fence runs to
+#     the end of the body, as in CommonMark)
+#   - text inside an inline code span (a backtick run closed by a run of the
+#     SAME length, within one paragraph; an unmatched run is literal text and
+#     does not hide anything)
+#   - `x@name` — an `@` preceded by a letter or digit is an email-like token
+#   - `@name-more` / `@namemore` — the login token is [A-Za-z0-9-]+, so a
+#     registry name only matches the WHOLE token (word-boundary matching)
+# Indentation is NOT interpreted (a deliberate choice, not an oversight). A line
+# indented 4+ spaces is scanned like any other line of its paragraph:
+#   - an @name inside an indented code block is REFUSED (GitHub would not
+#     notify) — the recoverable direction; backticks fix it;
+#   - backticks on indented lines still pair as code spans within the
+#     paragraph, so `    ```` lines around a mention hide it although
+#     CommonMark would notify. Contrived, and documented in the README.
+# Implementing indented code blocks properly needs list context: indented text
+# under a list item is a paragraph and DOES notify, and treating it as code
+# would hide real mentions — the dangerous direction.
+#
+# Registry names are compared against tokens of [A-Za-z0-9-] (the GitHub login
+# alphabet), so a registry name containing any other character (a dot, an
+# underscore) can never match and is effectively ignored. Such a name cannot
+# be a GitHub login, so it cannot be notified either.
+# shellcheck disable=SC2016  # awk program: $ and backticks are awk's, not the shell's
+MENTION_AWK='
+function fence_of(line,   sp, c, n) {
+  sp = 0
+  while (substr(line, sp + 1, 1) == " ") sp++
+  if (sp > 3) return ""
+  c = substr(line, sp + 1, 1)
+  if (c != "`" && c != "~") return ""
+  n = 0
+  while (substr(line, sp + 1 + n, 1) == c) n++
+  if (n < 3) return ""
+  if (c == "`" && index(substr(line, sp + 1 + n), "`") > 0) return ""
+  return c n
+}
+function closes_fence(line, fc, fl,   sp, n, rest) {
+  sp = 0
+  while (substr(line, sp + 1, 1) == " ") sp++
+  if (sp > 3) return 0
+  n = 0
+  while (substr(line, sp + 1 + n, 1) == fc) n++
+  if (n < fl) return 0
+  rest = substr(line, sp + 1 + n)
+  return (rest ~ /^[ \t]*$/)
+}
+function strip_spans(s,   out, p, n, rem, q, k, closed, base) {
+  out = ""
+  while ((p = index(s, "`")) > 0) {
+    out = out substr(s, 1, p - 1)
+    n = 0
+    while (substr(s, p + n, 1) == "`") n++
+    rem = substr(s, p + n)
+    closed = 0; base = 0
+    while ((q = index(substr(rem, base + 1), "`")) > 0) {
+      q += base
+      k = 0
+      while (substr(rem, q + k, 1) == "`") k++
+      if (k == n) { closed = 1; break }
+      base = q + k - 1
+    }
+    if (closed) {
+      out = out " "
+      s = substr(rem, q + n)
+    } else {
+      out = out substr(s, p, n)
+      s = rem
+    }
+  }
+  return out s
+}
+function scan(s,   p, prev, tok, t2) {
+  s = strip_spans(s)
+  while ((p = index(s, "@")) > 0) {
+    prev = (p > 1) ? substr(s, p - 1, 1) : ""
+    s = substr(s, p + 1)
+    if (prev ~ /[A-Za-z0-9]/) continue
+    if (!match(s, /^[A-Za-z0-9-]+/)) continue
+    tok = tolower(substr(s, 1, RLENGTH))
+    t2 = tok
+    sub(/-+$/, "", t2)
+    if (tok in reg) found[tok] = 1
+    else if (t2 in reg) found[t2] = 1
+  }
+}
+# Two readings of the same lines, and a mention passes only if BOTH hide it.
+#   buf  — the paragraph as a blank line delimits it (the reading GitHub uses
+#          when a line that LOOKS like a block start cannot interrupt the
+#          paragraph, e.g. `2.` mid-paragraph);
+#   buf2 — also broken at every candidate block start (list item, ATX
+#          heading, blockquote), which is what GitHub does in most bodies.
+# Whether a candidate line really starts a block depends on list context we do
+# not parse, so neither reading alone is safe: buf alone lets a stray backtick
+# in one bullet pair into the next bullet; buf2 alone lets `a\n2. b` split a
+# span GitHub keeps whole. Scanning both and refusing the union errs only
+# toward refusing, which the caller recovers from with backticks.
+function flush() {
+  if (buf != "") scan(buf)
+  buf = ""
+  flush2()
+}
+function flush2() { if (buf2 != "") scan(buf2); buf2 = "" }
+BEGIN {
+  n = split(tolower(names), a, ",")
+  for (i = 1; i <= n; i++) if (a[i] != "") reg[a[i]] = 1
+  n = split(tolower(allow), a, ",")
+  for (i = 1; i <= n; i++) {
+    gsub(/^[ \t@]+|[ \t]+$/, "", a[i])
+    if (a[i] in reg) delete reg[a[i]]
+  }
+  infence = 0; buf = ""; buf2 = ""
+}
+{
+  line = $0
+  # CRLF bodies: a line that is only "\r" is blank, and a fence line ending in
+  # "\r" is still a fence.
+  sub(/\r$/, "", line)
+  if (infence) {
+    if (closes_fence(line, fchar, flen)) infence = 0
+    next
+  }
+  f = fence_of(line)
+  if (f != "") {
+    flush()
+    infence = 1; fchar = substr(f, 1, 1); flen = substr(f, 2) + 0
+    next
+  }
+  # A blank line ends the paragraph. Code spans are inline and cannot cross a
+  # paragraph break, so pairing must restart here — otherwise a stray backtick
+  # in one paragraph pairs with one in a later paragraph and hides a real
+  # mention between them.
+  if (line ~ /^[ \t]*$/) { flush(); next }
+  # Candidate block start (up to 3 spaces, then a bullet, an ordered-list
+  # marker, an ATX heading, or a blockquote): break the second reading only.
+  if (line ~ /^[ ]?[ ]?[ ]?([-+*]|[0-9]+[.)]|#+)([ \t]|$)/ || line ~ /^[ ]?[ ]?[ ]?>/) flush2()
+  buf = buf line "\n"
+  buf2 = buf2 line "\n"
+}
+END {
+  flush()
+  for (k in found) print k
+}
+'
+
+# Resolve jq for reading the registry. /usr/bin/jq ships with macOS 15+; fall
+# back to PATH. No jq means the registry cannot be read, which fails open.
+# GH_FILTER_JQ overrides the lookup (and lets the suite exercise the no-jq
+# path on a host where /usr/bin/jq exists): anything but an absolute path to an
+# executable file counts as "no jq".
+_mention_jq() {
+  if [ -n "${GH_FILTER_JQ:-}" ]; then
+    # Absolute path to an executable regular FILE only. A directory passes -x,
+    # and a bare name would be resolved against the cwd by -x but against PATH
+    # when run — either way the "jq not found" warning would be wrong.
+    case "$GH_FILTER_JQ" in
+      /*) [ -f "$GH_FILTER_JQ" ] && [ -x "$GH_FILTER_JQ" ] && echo "$GH_FILTER_JQ" ;;
+    esac
+    return 0
+  fi
+  if [ -x /usr/bin/jq ]; then echo /usr/bin/jq; return 0; fi
+  command -v jq 2>/dev/null
+}
+
+mention_warn() {
+  /bin/echo "gh-filter: WARNING — @-mention guard skipped (failing open): $1" >&2
+}
+
+# Prints offending names, one per line; warnings go to stderr. Reads the
+# caller's `texts` and `files` arrays (bash locals are dynamically scoped).
+# Every failure to READ THE REGISTRY returns with no hits: fail open.
+_mention_scan() {
+  local jq_bin names t f
+  if [ ! -r "$MENTION_GUARD_REGISTRY" ]; then
+    mention_warn "registry '$MENTION_GUARD_REGISTRY' is missing or unreadable"
+    return 0
+  fi
+  jq_bin=$(_mention_jq)
+  if [ -z "$jq_bin" ]; then
+    mention_warn "jq not found, cannot read registry '$MENTION_GUARD_REGISTRY'"
+    return 0
+  fi
+  # Accepts a JSON array of strings, or of objects carrying a "name" string.
+  if ! names=$("$jq_bin" -r '.[] | if type == "object" then .name else . end | strings' \
+                  "$MENTION_GUARD_REGISTRY" 2>/dev/null | /usr/bin/tr '\n' ','); then
+    mention_warn "registry '$MENTION_GUARD_REGISTRY' is not a JSON array of names"
+    return 0
+  fi
+  if [ -z "${names//,/}" ]; then
+    mention_warn "registry '$MENTION_GUARD_REGISTRY' lists no names"
+    return 0
+  fi
+  if [ "${#texts[@]}" -gt 0 ]; then
+    for t in "${texts[@]}"; do
+      printf '%s\n' "$t" | /usr/bin/awk -v names="$names" -v allow="$MENTION_GUARD_ALLOW" "$MENTION_AWK"
+    done
+  fi
+  if [ "${#files[@]}" -gt 0 ]; then
+    for f in "${files[@]}"; do
+      # An unreadable body file is gh's error to report, not ours.
+      [ -r "$f" ] || continue
+      /usr/bin/awk -v names="$names" -v allow="$MENTION_GUARD_ALLOW" "$MENTION_AWK" < "$f"
+    done
+  fi
+  return 0
+}
+
+# Collect every body this invocation would send, then scan them. Bodies are
+# collected as literal TEXT or as a FILE path; `-` / `@-` mean stdin, which is
+# read once into a temp file, scanned, and re-attached as stdin for the real gh
+# so the caller's input still arrives.
+mention_guard() {
+  [ -n "$MENTION_GUARD_REGISTRY" ] || return 0
+
+  # The command group and verb are the first two non-flag words. gh accepts
+  # `-R/--repo` both before the verb (`gh pr -R owner/x comment ...`) and
+  # before the group (`gh -R owner/x pr comment ...`), so neither `$1` nor
+  # `$2` is reliable: skip flags, and skip the value of a space-separated
+  # `-R`/`--repo` (the only value-taking flag allowed in those positions).
+  local applies=0 group="" verb="" j=1 w
+  while [ "$j" -le "$#" ]; do
+    w="${!j}"
+    case "$w" in
+      -R|--repo) j=$((j+2)); continue ;;
+      -*)        j=$((j+1)); continue ;;
+    esac
+    if [ -z "$group" ]; then group="$w"; else verb="$w"; break; fi
+    j=$((j+1))
+  done
+  case "$group" in
+    issue) case "$verb" in create|new|comment|edit|close|reopen) applies=1 ;; esac ;;
+    pr)    case "$verb" in create|new|comment|edit|review|close|reopen) applies=1 ;; esac ;;
+    api)   applies=1 ;;
+  esac
+  [ "$applies" = "1" ] || return 0
+
+  local -a texts=() files=()
+  local want_stdin=0 i=0 a kv key val
+  local -a av=("$@")
+  while [ $i -lt ${#av[@]} ]; do
+    a="${av[$i]}"
+    kv=""
+    if [ "$group" = "api" ]; then
+      # kv gets "key=value"; typed=1 when the flag is -F/--field (which reads
+      # `@path` values from a file), 0 for -f/--raw-field (always literal).
+      local typed=0
+      case "$a" in
+        --) break ;;
+        -f|--raw-field)  i=$((i+1)); kv="${av[$i]:-}"; typed=0 ;;
+        -F|--field)      i=$((i+1)); kv="${av[$i]:-}"; typed=1 ;;
+        --raw-field=*)   kv="${a#--raw-field=}"; typed=0 ;;
+        --field=*)       kv="${a#--field=}"; typed=1 ;;
+        -f=*)            kv="${a#-f=}"; typed=0 ;;
+        -F=*)            kv="${a#-F=}"; typed=1 ;;
+        -f?*)            kv="${a#-f}"; typed=0 ;;
+        -F?*)            kv="${a#-F}"; typed=1 ;;
+      esac
+      if [ -n "$kv" ]; then
+        case "$kv" in *=*) ;; *) kv="" ;; esac
+      fi
+      if [ -n "$kv" ]; then
+        key="${kv%%=*}"; val="${kv#*=}"
+        case "$key" in
+          body|*'[body]')
+            if [ "$typed" = "1" ] && [ "${val#@}" != "$val" ]; then
+              if [ "$val" = "@-" ]; then want_stdin=1; else files+=("${val#@}"); fi
+            else
+              texts+=("$val")
+            fi
+            ;;
+        esac
+      fi
+    else
+      case "$a" in
+        --) break ;;
+        --body|-b)       i=$((i+1)); texts+=("${av[$i]:-}") ;;
+        # `issue|pr close|reopen -c, --comment string` posts a comment, which
+        # notifies like any other (receipt: `gh issue close --help`, 2.102.0).
+        # Only on those verbs: -c means nothing on the others.
+        --comment|-c)    if [ "$verb" = "close" ] || [ "$verb" = "reopen" ]; then
+                           i=$((i+1)); texts+=("${av[$i]:-}")
+                         fi ;;
+        --comment=*|-c=*|-c?*)
+                         if [ "$verb" = "close" ] || [ "$verb" = "reopen" ]; then
+                           case "$a" in
+                             --comment=*) texts+=("${a#--comment=}") ;;
+                             -c=*)        texts+=("${a#-c=}") ;;
+                             *)           texts+=("${a#-c}") ;;
+                           esac
+                         fi ;;
+        --body=*)        texts+=("${a#--body=}") ;;
+        -b=*)            texts+=("${a#-b=}") ;;
+        -b?*)            texts+=("${a#-b}") ;;
+        --body-file|-F)  i=$((i+1)); val="${av[$i]:-}"
+                         if [ "$val" = "-" ]; then want_stdin=1; elif [ -n "$val" ]; then files+=("$val"); fi ;;
+        --body-file=*|-F=*|-F?*)
+                         case "$a" in
+                           --body-file=*) val="${a#--body-file=}" ;;
+                           -F=*)          val="${a#-F=}" ;;
+                           *)             val="${a#-F}" ;;
+                         esac
+                         if [ "$val" = "-" ]; then want_stdin=1; elif [ -n "$val" ]; then files+=("$val"); fi ;;
+      esac
+    fi
+    i=$((i+1))
+  done
+
+  # stdin (`--body-file -`, `-F body=@-`) is read ONCE into a temp file. The
+  # scan opens that file BY PATH, so it gets its own offset; afterwards — on
+  # every path, fail-open included — the file is attached as this process's
+  # stdin and unlinked. `exec 0<` survives into the later `exec "$REAL_GH"`,
+  # and an unlinked file stays readable through its open descriptor, so the
+  # real gh still receives the caller's input from byte 0.
+  local stdin_tmp=""
+  if [ "$want_stdin" = "1" ]; then
+    if stdin_tmp=$(/usr/bin/mktemp -t gh-filter-stdin); then
+      /bin/cat > "$stdin_tmp"
+      files+=("$stdin_tmp")
+    else
+      stdin_tmp=""
+      mention_warn "could not create a temp file to inspect stdin"
+    fi
+  fi
+
+  local hits=""
+  if [ "${#texts[@]}" -gt 0 ] || [ "${#files[@]}" -gt 0 ]; then
+    hits=$(_mention_scan)
+  fi
+
+  if [ -n "$stdin_tmp" ]; then
+    exec 0<"$stdin_tmp"
+    /bin/rm -f "$stdin_tmp"
+  fi
+
+  if [ -n "$hits" ]; then
+    local list suggest="" n
+    list=$(printf '%s' "$hits" | /usr/bin/sort -u | /usr/bin/sed '/^$/d')
+    while IFS= read -r n; do
+      suggest+="    \`$n\`   or   the $n agent"$'\n'
+    done <<< "$list"
+    /bin/cat >&2 <<EOF
+================================================================
+gh-filter: REFUSED — body @-mentions an agent name
+================================================================
+Command:   gh ${group} ${verb}
+Mentioned: $(printf '%s' "$list" | /usr/bin/sed 's/^/@/' | /usr/bin/paste -sd ' ' -)
+Registry:  ${MENTION_GUARD_REGISTRY}
+
+Agent names are not GitHub users. When an agent name is ALSO a real
+GitHub login, '@name' notifies that stranger. Nothing was posted.
+
+Write the name without the @-mention instead, for example:
+${suggest}
+Mentions inside \`inline code\` or fenced code blocks are fine: GitHub
+does not notify for them.
+================================================================
+EOF
+    exit 77
+  fi
+  return 0
+}
+
+mention_guard "$@"
 
 # ---- Target repo detection --------------------------------------------------
 #
