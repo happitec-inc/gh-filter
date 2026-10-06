@@ -895,6 +895,32 @@ assert_mention "unmatched backtick hides nothing" block pr comment 1 "$R" -b 'a 
 # stop. Measured: exit 0, real gh reached, before the blank-line flush.
 # shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
 assert_mention "stray backtick cannot pair across a paragraph" block pr comment 1 "$R" -b $'Use ` here.\n\nThanks @queen and `x`.'
+# The same false negative at the OTHER block boundaries GitHub recognises: a
+# list item, an ATX heading, a blockquote, and a CRLF blank line all end the
+# paragraph, so a backtick before them cannot pair with one after. Each of
+# these was rendered through GitHub's /markdown endpoint in review and
+# notifies; each passed the guard before union pairing (measured: exit 0,
+# real gh reached). The two-bullet shape is the common one in review bodies.
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "backtick cannot pair into a list item"   block pr comment 1 "$R" -b $'Use ` here.\n- Thanks @queen and `x`.'
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "backtick cannot pair across two bullets" block pr comment 1 "$R" -b $'- Use ` here.\n- Thanks @queen and `x`.'
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "backtick cannot pair into a heading"     block pr comment 1 "$R" -b $'Use ` here.\n## Thanks @queen `x`'
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "backtick cannot pair into a blockquote"  block pr comment 1 "$R" -b $'Use ` here.\n> Thanks @queen `x`'
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "backtick cannot pair across a CRLF blank line" block pr comment 1 "$R" -b $'Use ` here.\r\n\r\nThanks @queen and `x`.'
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "backtick cannot pair across a whitespace-only line" block pr comment 1 "$R" -b $'Use ` here.\n \t\nThanks @queen and `x`.'
+# The ambiguous case that rules out "flush at every block start": `2.` cannot
+# interrupt a paragraph, so GitHub pairs `a\n2. b` and the mention after it
+# NOTIFIES. Pairing both ways and refusing the union keeps this refused.
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "\`2.\` mid-paragraph does not break a span" block pr comment 1 "$R" -b $'foo `a\n2. b` @queen `c`'
+# And the union must not over-refuse what both readings agree is code.
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "CRLF fenced block still passes" allow pr comment 1 "$R" -b $'```\r\n@queen\r\n```\r\n'
 # Control for the fix's blast radius: a span that wraps lines WITHIN one
 # paragraph is still one span.
 # shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
@@ -905,6 +931,18 @@ assert_mention "pr -R x comment (flag before verb)"      block pr -R test-allowe
 assert_mention "issue --repo x comment (flag before verb)" block issue --repo test-allowed-org/x comment 1 -b "thanks @queen"
 assert_mention "pr --repo=x review (flag before verb)"   block pr --repo=test-allowed-org/x review 1 --comment -b "thanks @queen"
 assert_mention "pr -R x view (read, flag before verb)"   allow pr -R test-allowed-org/x view 1
+# ...and before the command GROUP: gh accepts `gh -R x pr comment`, where
+# SUBCMD is `-R` and the guard used to return early (measured: exit 0).
+assert_mention "-R x pr comment (flag before group)"     block -R test-allowed-org/x pr comment 1 -b "thanks @queen"
+assert_mention "--repo=x issue comment (flag before group)" block --repo=test-allowed-org/x issue comment 1 -b "thanks @queen"
+assert_mention "-R x pr view (read, flag before group)"  allow -R test-allowed-org/x pr view 1
+# `close`/`reopen` post their -c/--comment as a comment, which notifies.
+assert_mention "issue close --comment @queen"            block issue close 1 "$R" --comment "fixed, thanks @queen"
+assert_mention "issue reopen -c @queen"                  block issue reopen 1 "$R" -c "cc @queen"
+assert_mention "pr close --comment=@queen"               block pr close 1 "$R" "--comment=cc @queen"
+assert_mention "pr reopen -c… (attached)"                block pr reopen 1 "$R" "-ccc @queen"
+assert_mention "issue close --comment clean"             allow issue close 1 "$R" --comment "fixed, thanks to the queen agent"
+assert_mention "pr comment -c is not a body flag"        allow pr comment 1 "$R" -b "plain" -c "@queen"
 # Indentation is documented as NOT interpreted (README, Known gaps). Pin both
 # halves so a change in that behavior is a visible decision, not a drift:
 assert_mention "indented code block: refused (documented)" block pr comment 1 "$R" -b $'Log:\n\n    @queen said hi'
@@ -989,6 +1027,25 @@ if [ "$ec" != "77" ] && [ -e "$MG_DIR/reached" ] && /usr/bin/grep -q 'WARNING.*j
 else
   FAIL=$((FAIL+1)); echo "FAIL: no jq (exit $ec, err: $(/bin/cat "$MG_DIR/err"))"
 fi
+# A RELATIVE name or a DIRECTORY is not a jq either, and the warning must say
+# so. Both used to fail open with the misleading "lists no names" (a
+# directory passes -x; a bare name was then looked up on PATH).
+# The relative case runs from a directory holding an executable `./jq`, which
+# is what made `-x jq` true there while bash then ran the PATH jq instead.
+/bin/mkdir -p "$MG_DIR/cwd-with-jq"
+printf '#!/bin/sh\nexit 0\n' > "$MG_DIR/cwd-with-jq/jq"; /bin/chmod +x "$MG_DIR/cwd-with-jq/jq"
+for mg_badjq in "jq" "$MG_DIR"; do
+  /bin/rm -f "$MG_DIR/reached"
+  ( cd "$MG_DIR/cwd-with-jq" || exit 99
+    GH_FILTER_JQ="$mg_badjq" GH_FILTER_REAL_GH="$MG_STUB" GH_FILTER_MENTION_GUARD_REGISTRY="$MG_REG" \
+      "$FILTER" pr comment 1 "$R" -b "thanks @queen" </dev/null >/dev/null 2>"$MG_DIR/err" )
+  ec=$?
+  if [ "$ec" != "77" ] && [ -e "$MG_DIR/reached" ] && /usr/bin/grep -q 'jq not found' "$MG_DIR/err"; then
+    PASS=$((PASS+1)); echo "PASS: GH_FILTER_JQ='$mg_badjq' → 'jq not found', fails open"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: GH_FILTER_JQ='$mg_badjq' (exit $ec, err: $(/bin/cat "$MG_DIR/err"))"
+  fi
+done
 # Control for the override itself: pointed at a real jq it still refuses, so
 # the PASS above is the missing jq, not the override switching the guard off.
 MG_JQ=$(/usr/bin/env PATH=/usr/bin:/opt/homebrew/bin:/usr/local/bin:/bin /bin/sh -c 'command -v jq')

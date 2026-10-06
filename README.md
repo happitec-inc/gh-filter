@@ -304,15 +304,18 @@ The registry is a JSON array of names, either bare strings or objects with a `"n
 |---|---|
 | `issue create` / `new`, `issue comment`, `issue edit` | `-b`/`--body`, `-F`/`--body-file` (a file, or `-` for stdin) |
 | `pr create` / `new`, `pr comment`, `pr edit`, `pr review` | same |
+| `issue close`, `issue reopen`, `pr close`, `pr reopen` | `-c`/`--comment` |
 | `api` | `-f`/`--raw-field` and `-F`/`--field` whose key is `body` or ends in `[body]` (e.g. `comments[][body]`); `-F body=@file` and `-F body=@-` are read |
 
-All spellings are recognised (`--body X`, `--body=X`, `-b X`, `-bX`, `-b=X`, and the same for the other flags), including `-R`/`--repo` placed before the verb (`gh pr -R owner/repo comment 1 -b ...`). When the body comes from stdin, the filter reads it, scans it, and hands the same bytes to the real `gh`.
+All spellings are recognised (`--body X`, `--body=X`, `-b X`, `-bX`, `-b=X`, and the same for the other flags), including `-R`/`--repo` placed before the verb (`gh pr -R owner/repo comment 1 -b ...`) or before the command group (`gh -R owner/repo pr comment 1 -b ...`). When the body comes from stdin, the filter reads it, scans it, and hands the same bytes to the real `gh`.
 
 ### Matching
 
 - **Case-insensitive, whole token.** `@Reviewer-Bot` matches `reviewer-bot`; `@reviewer-bot2` and `@reviewer-bots` do not.
 - **Not a mention:** `x@name` (an `@` preceded by a letter or digit, as in an email address).
-- **Not scanned:** text in inline code spans (`` `@name` ``) and fenced code blocks (```` ``` ```` or `~~~`). GitHub does not notify for those, so backticks are the fix. A code span cannot cross a blank line, so a stray backtick in one paragraph does not hide a mention in the next.
+- **Not scanned:** text in inline code spans (`` `@name` ``) and fenced code blocks (```` ``` ```` or `~~~`). GitHub does not notify for those, so backticks are the fix. A code span can't cross a paragraph boundary, so a stray backtick in one paragraph or list item doesn't hide a mention in the next.
+
+  Some lines that look like block starts (a bullet, an ordered-list marker, a heading, a blockquote) don't always end the paragraph. For example, `2.` can't interrupt a paragraph, and GitHub keeps a span across it. Telling those cases apart needs list context, so the guard pairs backticks two ways: once breaking only at blank lines, and once also breaking at every such line. A mention passes only if both readings put it inside code. When the guard is wrong, it refuses, and backticks around the name fix the refusal. CRLF line endings are handled.
 
 ### Refusal
 
@@ -390,7 +393,7 @@ The script also reads these environment variables at runtime (each overrides the
 | `GH_FILTER_AGENT_MARKER_ENVS`     | value of `AGENT_MARKER_ENVS` in config               | Override the agent marker env list            |
 | `GH_FILTER_MENTION_GUARD_REGISTRY` | value of `MENTION_GUARD_REGISTRY` in config         | Override the mention-guard registry path      |
 | `GH_FILTER_MENTION_GUARD_ALLOW`   | value of `MENTION_GUARD_ALLOW` in config             | Override the mention-guard exempt handles     |
-| `GH_FILTER_JQ`                    | `/usr/bin/jq`, else `jq` on `$PATH`                  | `jq` used to read the mention-guard registry; a non-executable value means "no jq" (fails open) |
+| `GH_FILTER_JQ`                    | `/usr/bin/jq`, else `jq` on `$PATH`                  | `jq` used to read the mention-guard registry; anything but an absolute path to an executable file means "no jq" (fails open) |
 
 If `notify` isn't installed or isn't found, the filter silently skips the Pushover alert and still blocks the call. The phone alert is best-effort, not a precondition for enforcement.
 
