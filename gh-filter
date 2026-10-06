@@ -462,13 +462,26 @@ fi
 #     closed by the same fence char at least as long; an unclosed fence runs to
 #     the end of the body, as in CommonMark)
 #   - text inside an inline code span (a backtick run closed by a run of the
-#     SAME length; an unmatched run is literal text and does not hide anything)
+#     SAME length, within one paragraph; an unmatched run is literal text and
+#     does not hide anything)
 #   - `x@name` — an `@` preceded by a letter or digit is an email-like token
 #   - `@name-more` / `@namemore` — the login token is [A-Za-z0-9-]+, so a
 #     registry name only matches the WHOLE token (word-boundary matching)
-# Indented (4-space) code blocks are NOT stripped: telling one apart from a
-# continuation line needs a real Markdown parser. That errs toward refusing,
-# which is the recoverable direction — backticks fix it.
+# Indentation is NOT interpreted (a deliberate choice, not an oversight). A line
+# indented 4+ spaces is scanned like any other line of its paragraph:
+#   - an @name inside an indented code block is REFUSED (GitHub would not
+#     notify) — the recoverable direction; backticks fix it;
+#   - backticks on indented lines still pair as code spans within the
+#     paragraph, so `    ```` lines around a mention hide it although
+#     CommonMark would notify. Contrived, and documented in the README.
+# Implementing indented code blocks properly needs list context: indented text
+# under a list item is a paragraph and DOES notify, and treating it as code
+# would hide real mentions — the dangerous direction.
+#
+# Registry names are compared against tokens of [A-Za-z0-9-] (the GitHub login
+# alphabet), so a registry name containing any other character (a dot, an
+# underscore) can never match and is effectively ignored. Such a name cannot
+# be a GitHub login, so it cannot be notified either.
 # shellcheck disable=SC2016  # awk program: $ and backticks are awk's, not the shell's
 MENTION_AWK='
 function fence_of(line,   sp, c, n) {
@@ -570,7 +583,14 @@ END {
 
 # Resolve jq for reading the registry. /usr/bin/jq ships with macOS 15+; fall
 # back to PATH. No jq means the registry cannot be read, which fails open.
+# GH_FILTER_JQ overrides the lookup (and lets the suite exercise the no-jq
+# path on a host where /usr/bin/jq exists): a value that is not executable
+# counts as "no jq".
 _mention_jq() {
+  if [ -n "${GH_FILTER_JQ:-}" ]; then
+    [ -x "$GH_FILTER_JQ" ] && echo "$GH_FILTER_JQ"
+    return 0
+  fi
   if [ -x /usr/bin/jq ]; then echo /usr/bin/jq; return 0; fi
   command -v jq 2>/dev/null
 }
@@ -625,10 +645,22 @@ _mention_scan() {
 mention_guard() {
   [ -n "$MENTION_GUARD_REGISTRY" ] || return 0
 
-  local applies=0
+  # The verb is the first non-flag word after the command group. gh also
+  # accepts the group's persistent `-R/--repo` BEFORE the verb
+  # (`gh pr -R owner/x comment 1 -b ...`), so `${2}` is not reliably the verb:
+  # skip flags, and skip the value of a space-separated `-R`/`--repo`.
+  local applies=0 verb="" j=2 w
+  while [ "$j" -le "$#" ]; do
+    w="${!j}"
+    case "$w" in
+      -R|--repo) j=$((j+2)); continue ;;
+      -*)        j=$((j+1)); continue ;;
+      *)         verb="$w"; break ;;
+    esac
+  done
   case "$SUBCMD" in
-    issue) case "${2:-}" in create|new|comment|edit) applies=1 ;; esac ;;
-    pr)    case "${2:-}" in create|new|comment|edit|review) applies=1 ;; esac ;;
+    issue) case "$verb" in create|new|comment|edit) applies=1 ;; esac ;;
+    pr)    case "$verb" in create|new|comment|edit|review) applies=1 ;; esac ;;
     api)   applies=1 ;;
   esac
   [ "$applies" = "1" ] || return 0
@@ -727,7 +759,7 @@ mention_guard() {
 ================================================================
 gh-filter: REFUSED — body @-mentions an agent name
 ================================================================
-Command:   gh ${SUBCMD} ${2:-}
+Command:   gh ${SUBCMD} ${verb}
 Mentioned: $(printf '%s' "$list" | /usr/bin/sed 's/^/@/' | /usr/bin/paste -sd ' ' -)
 Registry:  ${MENTION_GUARD_REGISTRY}
 

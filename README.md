@@ -306,13 +306,13 @@ The registry is a JSON array of names, either bare strings or objects with a `"n
 | `pr create` / `new`, `pr comment`, `pr edit`, `pr review` | same |
 | `api` | `-f`/`--raw-field` and `-F`/`--field` whose key is `body` or ends in `[body]` (e.g. `comments[][body]`); `-F body=@file` and `-F body=@-` are read |
 
-All spellings are recognised (`--body X`, `--body=X`, `-b X`, `-bX`, `-b=X`, and the same for the other flags). When the body comes from stdin, the filter reads it, scans it, and hands the same bytes to the real `gh`.
+All spellings are recognised (`--body X`, `--body=X`, `-b X`, `-bX`, `-b=X`, and the same for the other flags), including `-R`/`--repo` placed before the verb (`gh pr -R owner/repo comment 1 -b ...`). When the body comes from stdin, the filter reads it, scans it, and hands the same bytes to the real `gh`.
 
 ### Matching
 
 - **Case-insensitive, whole token.** `@Reviewer-Bot` matches `reviewer-bot`; `@reviewer-bot2` and `@reviewer-bots` do not.
 - **Not a mention:** `x@name` (an `@` preceded by a letter or digit, as in an email address).
-- **Not scanned:** text in inline code spans (`` `@name` ``) and fenced code blocks (```` ``` ```` or `~~~`). GitHub does not notify for those, so backticks are the fix.
+- **Not scanned:** text in inline code spans (`` `@name` ``) and fenced code blocks (```` ``` ```` or `~~~`). GitHub does not notify for those, so backticks are the fix. A code span cannot cross a blank line, so a stray backtick in one paragraph does not hide a mention in the next.
 
 ### Refusal
 
@@ -330,7 +330,11 @@ Write the name without the @-mention instead, for example:
 - `pr create --fill` / `--fill-first` / `--fill-verbose` take the body from commit messages, and `-T`/`--template` from a template file; neither is scanned.
 - `api --input` (a raw request body) is not scanned, and neither are fields other than `body`.
 - Other writes that notify (`release create --notes`, commit messages) are not covered.
-- Indented (4-space) code blocks are **not** treated as code, so an `@name` inside one is refused. That errs toward refusing, and backticks fix it.
+- Indentation is not interpreted. A line indented 4 or more spaces is scanned like any other line of its paragraph, so:
+  - an `@name` inside an indented code block is **refused**, though GitHub would not notify (backticks fix it);
+  - backticks on indented lines still pair as code spans within a paragraph, so a mention between two indented ```` ``` ```` lines is **not** refused, though GitHub would notify. This is contrived; it is documented rather than fixed because handling indented code properly needs list context (indented text under a list item is a paragraph and does notify).
+- Registry names are matched against `[A-Za-z0-9-]` tokens, the characters a GitHub login can contain. A registry name with any other character (for example `example.com` or `my_bot`) can never match and is effectively ignored. Such a name cannot be a GitHub login, so nobody can be notified through it.
+- Bodies written in an editor (`-e`/`--editor`) or entered at an interactive prompt are not scanned.
 - Like everything here, it only sees `gh`. A raw `curl` to the API bypasses it.
 
 ## Subcommands always passed through (no repo check)
@@ -386,6 +390,7 @@ The script also reads these environment variables at runtime (each overrides the
 | `GH_FILTER_AGENT_MARKER_ENVS`     | value of `AGENT_MARKER_ENVS` in config               | Override the agent marker env list            |
 | `GH_FILTER_MENTION_GUARD_REGISTRY` | value of `MENTION_GUARD_REGISTRY` in config         | Override the mention-guard registry path      |
 | `GH_FILTER_MENTION_GUARD_ALLOW`   | value of `MENTION_GUARD_ALLOW` in config             | Override the mention-guard exempt handles     |
+| `GH_FILTER_JQ`                    | `/usr/bin/jq`, else `jq` on `$PATH`                  | `jq` used to read the mention-guard registry; a non-executable value means "no jq" (fails open) |
 
 If `notify` isn't installed or isn't found, the filter silently skips the Pushover alert and still blocks the call. The phone alert is best-effort, not a precondition for enforcement.
 

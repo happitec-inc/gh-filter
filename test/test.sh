@@ -899,6 +899,20 @@ assert_mention "stray backtick cannot pair across a paragraph" block pr comment 
 # paragraph is still one span.
 # shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
 assert_mention "span wrapping lines in one paragraph" allow pr comment 1 "$R" -b $'see `a\n@queen b` here'
+# gh accepts the group's -R/--repo BEFORE the verb. Reading the verb from $2
+# saw `-R` there and skipped the guard entirely (measured: exit 0, reached).
+assert_mention "pr -R x comment (flag before verb)"      block pr -R test-allowed-org/x comment 1 -b "thanks @queen"
+assert_mention "issue --repo x comment (flag before verb)" block issue --repo test-allowed-org/x comment 1 -b "thanks @queen"
+assert_mention "pr --repo=x review (flag before verb)"   block pr --repo=test-allowed-org/x review 1 --comment -b "thanks @queen"
+assert_mention "pr -R x view (read, flag before verb)"   allow pr -R test-allowed-org/x view 1
+# Indentation is documented as NOT interpreted (README, Known gaps). Pin both
+# halves so a change in that behavior is a visible decision, not a drift:
+assert_mention "indented code block: refused (documented)" block pr comment 1 "$R" -b $'Log:\n\n    @queen said hi'
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "indented \`\`\` lines pair (documented gap)" allow pr comment 1 "$R" -b $'    ```\n@queen\n    ```'
+# A registry name outside the login alphabet can never match (documented).
+mg_reg_dot="$MG_DIR/dot.json"; /bin/echo '["example.com"]' > "$mg_reg_dot"
+MG_REGISTRY="$mg_reg_dot" assert_mention "registry name with a dot is ignored (documented)" allow pr comment 1 "$R" -b "ping @example.com"
 mg_run pr comment 1 "$R" -b "thanks @queen and @thinker"
 if /usr/bin/grep -q '@queen @thinker' "$MG_DIR/err"; then
   PASS=$((PASS+1)); echo "PASS: refusal lists every offending name"
@@ -962,6 +976,35 @@ for bad in missing unreadable malformed empty; do
     FAIL=$((FAIL+1)); echo "FAIL: $bad registry (exit $ec, reached: $([ -e "$MG_DIR/reached" ] && echo yes || echo no))"
   fi
 done
+
+# No jq: the registry cannot be read, so the guard warns and fails open. On
+# macOS /usr/bin/jq exists, so a PATH scrub cannot reach this path;
+# GH_FILTER_JQ pointed at a non-executable path is how it is exercised.
+/bin/rm -f "$MG_DIR/reached"
+GH_FILTER_JQ="$MG_DIR/no-such-jq" GH_FILTER_REAL_GH="$MG_STUB" GH_FILTER_MENTION_GUARD_REGISTRY="$MG_REG" \
+  "$FILTER" pr comment 1 "$R" -b "thanks @queen" </dev/null >/dev/null 2>"$MG_DIR/err"
+ec=$?
+if [ "$ec" != "77" ] && [ -e "$MG_DIR/reached" ] && /usr/bin/grep -q 'WARNING.*jq not found.*failing open\|failing open.*jq not found' "$MG_DIR/err"; then
+  PASS=$((PASS+1)); echo "PASS: no jq → fails open with a warning"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: no jq (exit $ec, err: $(/bin/cat "$MG_DIR/err"))"
+fi
+# Control for the override itself: pointed at a real jq it still refuses, so
+# the PASS above is the missing jq, not the override switching the guard off.
+MG_JQ=$(/usr/bin/env PATH=/usr/bin:/opt/homebrew/bin:/usr/local/bin:/bin /bin/sh -c 'command -v jq')
+if [ -n "$MG_JQ" ]; then
+  /bin/rm -f "$MG_DIR/reached"
+  GH_FILTER_JQ="$MG_JQ" GH_FILTER_REAL_GH="$MG_STUB" GH_FILTER_MENTION_GUARD_REGISTRY="$MG_REG" \
+    "$FILTER" pr comment 1 "$R" -b "thanks @queen" </dev/null >/dev/null 2>&1
+  ec=$?
+  if [ "$ec" = "77" ] && [ ! -e "$MG_DIR/reached" ]; then
+    PASS=$((PASS+1)); echo "PASS: GH_FILTER_JQ=<real jq> → guard still refuses"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: GH_FILTER_JQ=<real jq> (exit $ec)"
+  fi
+else
+  echo "SKIP: GH_FILTER_JQ control (no jq on this host)"
+fi
 
 # The config-file key works too, not just the env override.
 MG_CFG="$MG_DIR/config"
