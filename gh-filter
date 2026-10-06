@@ -555,6 +555,11 @@ BEGIN {
     infence = 1; fchar = substr(f, 1, 1); flen = substr(f, 2) + 0
     next
   }
+  # A blank line ends the paragraph. Code spans are inline and cannot cross a
+  # paragraph break, so pairing must restart here — otherwise a stray backtick
+  # in one paragraph pairs with one in a later paragraph and hides a real
+  # mention between them.
+  if (line ~ /^[ \t]*$/) { flush(); next }
   buf = buf line "\n"
 }
 END {

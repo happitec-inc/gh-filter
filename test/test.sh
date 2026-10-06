@@ -889,6 +889,16 @@ assert_mention "@agents-app (hyphenated name)"    block pr comment 1 "$R" -b "pi
 assert_mention "@thinker (string registry entry)" block pr comment 1 "$R" -b "ping @thinker"
 assert_mention "mention AFTER a closed fence"     block pr comment 1 "$R" -b $'```\ncode\n```\nthanks @queen'
 assert_mention "unmatched backtick hides nothing" block pr comment 1 "$R" -b 'a ` stray tick, thanks @queen'
+# Code spans are inline: they cannot cross a paragraph break. A stray backtick
+# in one paragraph used to pair with one in a LATER paragraph and hide a real
+# mention between them — a false negative, the direction this guard exists to
+# stop. Measured: exit 0, real gh reached, before the blank-line flush.
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "stray backtick cannot pair across a paragraph" block pr comment 1 "$R" -b $'Use ` here.\n\nThanks @queen and `x`.'
+# Control for the fix's blast radius: a span that wraps lines WITHIN one
+# paragraph is still one span.
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "span wrapping lines in one paragraph" allow pr comment 1 "$R" -b $'see `a\n@queen b` here'
 mg_run pr comment 1 "$R" -b "thanks @queen and @thinker"
 if /usr/bin/grep -q '@queen @thinker' "$MG_DIR/err"; then
   PASS=$((PASS+1)); echo "PASS: refusal lists every offending name"
