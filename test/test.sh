@@ -770,6 +770,205 @@ fi
 /bin/rm -rf "$IDENT_DIR"
 
 echo ""
+echo "=== @-mention guard ==="
+# A body that @-mentions a registry name is refused (exit 77) and must never
+# reach the real binary — "nothing is posted" is asserted, not assumed, via a
+# stub that leaves a marker when it runs. The stub also captures its stdin so
+# the `--body-file -` path can prove the caller's input still arrives intact
+# after the guard has read it.
+#
+# Negative control, measured when this block was written: delete the
+# `mention_guard "$@"` call in gh-filter and "pr comment --body 'thanks @queen'"
+# goes red (exit 0, stub reached), along with every other BLOCK case here. The
+# ALLOW cases stay green in that world, which is why they cannot be the proof.
+MG_DIR=$(/usr/bin/mktemp -d)
+MG_REG="$MG_DIR/registry.json"
+# Objects with a "name" (the shape of a session registry), a bare string, and
+# an object with no name at all, which must be skipped rather than break parsing.
+/bin/cat > "$MG_REG" <<'EOF'
+[
+  {"name": "queen", "dir": "/x"},
+  {"name": "agents-app"},
+  {"name": "test-operator"},
+  {"dir": "/no/name/field"},
+  "thinker"
+]
+EOF
+MG_STUB="$MG_DIR/stub-gh"
+/bin/cat > "$MG_STUB" <<EOF
+#!/bin/bash
+: > "$MG_DIR/reached"
+/bin/cat > "$MG_DIR/stdin"
+exit 0
+EOF
+/bin/chmod +x "$MG_STUB"
+
+# mg_run ARGS... — run the filter with the guard pointed at the fixture
+# registry. MG_REGISTRY (set, possibly empty) overrides the registry path;
+# MG_ALLOW sets the exempt list; MG_IN is the file fed on stdin.
+mg_run() {
+  /bin/rm -f "$MG_DIR/reached" "$MG_DIR/stdin" "$MG_DIR/err"
+  env GH_FILTER_REAL_GH="$MG_STUB" \
+      GH_FILTER_MENTION_GUARD_REGISTRY="${MG_REGISTRY-$MG_REG}" \
+      GH_FILTER_MENTION_GUARD_ALLOW="${MG_ALLOW:-}" \
+      "$FILTER" "$@" < "${MG_IN:-/dev/null}" >/dev/null 2>"$MG_DIR/err"
+}
+
+# assert_mention LABEL block|allow ARGS...
+# block = exit 77, the real binary NOT reached, and the refusal names the
+#         backticked form to write instead.
+# allow = not 77 and the real binary reached.
+assert_mention() {
+  local label="$1" expected="$2"; shift 2
+  mg_run "$@"
+  local ec=$?
+  local reached=no
+  [ -e "$MG_DIR/reached" ] && reached=yes
+  if [ "$expected" = "block" ] && [ "$ec" = "77" ] && [ "$reached" = "no" ] \
+     && /usr/bin/grep -q '^    `' "$MG_DIR/err"; then
+    PASS=$((PASS+1)); echo "PASS: $label (refused, nothing posted)"
+  elif [ "$expected" = "allow" ] && [ "$ec" != "77" ] && [ "$reached" = "yes" ]; then
+    PASS=$((PASS+1)); echo "PASS: $label (passed through)"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: $label  (expected $expected, exit $ec, real gh reached: $reached)"
+    echo "       cmd: gh $*"
+  fi
+}
+
+R="--repo=test-allowed-org/x"
+
+# --- The incident, and its exact remedy text ---------------------------------
+mg_run pr comment 1 "$R" --body "thanks @queen"
+ec=$?
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+if [ "$ec" = "77" ] && [ ! -e "$MG_DIR/reached" ] \
+   && /usr/bin/grep -q '`queen`' "$MG_DIR/err" \
+   && /usr/bin/grep -q 'the queen agent' "$MG_DIR/err"; then
+  PASS=$((PASS+1)); echo "PASS: pr comment --body 'thanks @queen' → refused, suggests \`queen\`, nothing posted"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: pr comment --body 'thanks @queen' (exit $ec, reached: $([ -e "$MG_DIR/reached" ] && echo yes || echo no))"
+fi
+
+# --- Every body spelling on every covered command ----------------------------
+assert_mention "pr comment --body=…@queen"        block pr comment 1 "$R" "--body=thanks @queen"
+assert_mention "pr comment -b …@queen"            block pr comment 1 "$R" -b "thanks @queen"
+assert_mention "pr comment -b…@queen (attached)"  block pr comment 1 "$R" "-b@queen thanks"
+assert_mention "issue comment -b=…@queen"         block issue comment 1 "$R" "-b=hi @queen"
+assert_mention "issue create --body @queen"       block issue create "$R" --title t --body "cc @queen"
+assert_mention "issue new (alias) --body @queen"  block issue new "$R" --title t --body "cc @queen"
+assert_mention "issue edit --body @queen"         block issue edit 1 "$R" --body "cc @queen"
+assert_mention "pr create --body @queen"          block pr create "$R" --title t --body "cc @queen"
+assert_mention "pr new (alias) --body @queen"     block pr new "$R" --title t --body "cc @queen"
+assert_mention "pr edit --body @queen"            block pr edit 1 "$R" --body "cc @queen"
+assert_mention "pr review --body @queen"          block pr review 1 "$R" --comment --body "cc @queen"
+
+MG_BODY="$MG_DIR/body.md"
+printf 'Review notes.\n\nThanks @queen for the catch.\n' > "$MG_BODY"
+assert_mention "issue create --body-file FILE"    block issue create "$R" --title t --body-file "$MG_BODY"
+assert_mention "issue comment -F FILE"            block issue comment 1 "$R" -F "$MG_BODY"
+assert_mention "pr comment --body-file=FILE"      block pr comment 1 "$R" "--body-file=$MG_BODY"
+assert_mention "pr edit -FFILE (attached)"        block pr edit 1 "$R" "-F$MG_BODY"
+MG_IN="$MG_BODY" assert_mention "pr review --body-file - (stdin)" block pr review 1 "$R" --comment --body-file -
+
+# `gh api`: -F reads `@path` / `@-` from a file / stdin; -f is always literal.
+API=(api repos/test-allowed-org/x/issues/1/comments)
+assert_mention "api -F body=@FILE"                block "${API[@]}" -F "body=@$MG_BODY"
+assert_mention "api --field=body=@FILE"           block "${API[@]}" "--field=body=@$MG_BODY"
+MG_IN="$MG_BODY" assert_mention "api -F body=@- (stdin)" block "${API[@]}" -F body=@-
+assert_mention "api -F body=literal @queen"       block "${API[@]}" -F "body=thanks @queen"
+assert_mention "api -f body=@queen (raw: literal)" block "${API[@]}" -f "body=@queen"
+assert_mention "api --raw-field=body=…"           block "${API[@]}" "--raw-field=body=cc @queen"
+assert_mention "api -fbody=… (attached)"          block "${API[@]}" "-fbody=cc @queen"
+assert_mention "api -f comments[][body]=…"        block api repos/test-allowed-org/x/pulls/1/reviews -f event=COMMENT -f "comments[][body]=cc @queen"
+
+# --- Matching rules: case-insensitive, word-boundary, any registry shape ------
+assert_mention "@QUEEN (case-insensitive)"        block pr comment 1 "$R" -b "thanks @QUEEN"
+assert_mention "(@queen) punctuation"             block pr comment 1 "$R" -b "thanks (@queen)."
+assert_mention "@queen, at start of body"         block pr comment 1 "$R" -b "@queen, thanks"
+assert_mention "@agents-app (hyphenated name)"    block pr comment 1 "$R" -b "ping @agents-app"
+assert_mention "@thinker (string registry entry)" block pr comment 1 "$R" -b "ping @thinker"
+assert_mention "mention AFTER a closed fence"     block pr comment 1 "$R" -b $'```\ncode\n```\nthanks @queen'
+assert_mention "unmatched backtick hides nothing" block pr comment 1 "$R" -b 'a ` stray tick, thanks @queen'
+mg_run pr comment 1 "$R" -b "thanks @queen and @thinker"
+if /usr/bin/grep -q '@queen @thinker' "$MG_DIR/err"; then
+  PASS=$((PASS+1)); echo "PASS: refusal lists every offending name"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: refusal did not list both names: $(/usr/bin/grep Mentioned "$MG_DIR/err")"
+fi
+
+# --- Allowed: not a mention, not an agent, or exempt -------------------------
+assert_mention "@some-human (not in registry)"    allow pr comment 1 "$R" -b "thanks @some-human"
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "inline code \`@queen\`"           allow pr comment 1 "$R" -b 'thanks `@queen`'
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+assert_mention "double-backtick span"             allow pr comment 1 "$R" -b 'see ``a ` @queen`` here'
+assert_mention "fenced \`\`\` block"              allow pr comment 1 "$R" -b $'log:\n```text\n@queen said hi\n```\ndone'
+assert_mention "fenced ~~~ block"                 allow pr comment 1 "$R" -b $'~~~\n@queen\n~~~'
+assert_mention "indented fence (3 spaces)"        allow pr comment 1 "$R" -b $'   ```\n@queen\n   ```'
+assert_mention "unclosed fence runs to end"       allow pr comment 1 "$R" -b $'```\n@queen'
+assert_mention "email-like foo@queen.example"         allow pr comment 1 "$R" -b "mail foo@queen.example"
+assert_mention "@queenbee (longer token)"         allow pr comment 1 "$R" -b "thanks @queenbee"
+assert_mention "@queen-bee (longer token)"        allow pr comment 1 "$R" -b "thanks @queen-bee"
+assert_mention "the queen agent (no @)"           allow pr comment 1 "$R" -b "thanks to the queen agent"
+assert_mention "api -f title=@queen (not a body)" allow "${API[@]}" -f "title=@queen"
+assert_mention "issue view (not a write)"         allow issue view 1 "$R"
+MG_ALLOW="test-operator" assert_mention "exempt handle via MENTION_GUARD_ALLOW" allow pr comment 1 "$R" -b "cc @test-operator"
+MG_ALLOW="@Test-Operator" assert_mention "exempt list is case-insensitive, @ optional" allow pr comment 1 "$R" -b "cc @test-operator"
+assert_mention "not exempt without the allow entry" block pr comment 1 "$R" -b "cc @test-operator"
+
+# stdin is read by the guard and must still reach the real gh, byte for byte.
+# shellcheck disable=SC2016  # literal backticks: Markdown code spans in the body
+printf 'all clear, `@queen` in code\n' > "$MG_DIR/clean.md"
+MG_IN="$MG_DIR/clean.md" mg_run pr comment 1 "$R" --body-file -
+if [ -e "$MG_DIR/reached" ] && /usr/bin/cmp -s "$MG_DIR/clean.md" "$MG_DIR/stdin"; then
+  PASS=$((PASS+1)); echo "PASS: --body-file - : real gh receives the caller's stdin intact"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: --body-file - : stdin not passed through intact"
+fi
+MG_IN="$MG_DIR/clean.md" mg_run "${API[@]}" -F body=@-
+if [ -e "$MG_DIR/reached" ] && /usr/bin/cmp -s "$MG_DIR/clean.md" "$MG_DIR/stdin"; then
+  PASS=$((PASS+1)); echo "PASS: api -F body=@- : real gh receives the caller's stdin intact"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: api -F body=@- : stdin not passed through intact"
+fi
+
+# --- Off by default, and fail OPEN on a bad registry -------------------------
+MG_REGISTRY="" assert_mention "guard not configured → no-op" allow pr comment 1 "$R" -b "thanks @queen"
+for bad in missing unreadable malformed empty; do
+  case "$bad" in
+    missing)    MG_BAD="$MG_DIR/does-not-exist.json" ;;
+    unreadable) MG_BAD="$MG_DIR/unreadable.json"; /bin/cp "$MG_REG" "$MG_BAD"; /bin/chmod 000 "$MG_BAD" ;;
+    malformed)  MG_BAD="$MG_DIR/malformed.json"; /bin/echo '{not json' > "$MG_BAD" ;;
+    empty)      MG_BAD="$MG_DIR/empty.json"; /bin/echo '[]' > "$MG_BAD" ;;
+  esac
+  MG_REGISTRY="$MG_BAD" mg_run pr comment 1 "$R" -b "thanks @queen"
+  ec=$?
+  # A root-run suite can read a mode-000 file; skip that case rather than lie.
+  if [ "$bad" = "unreadable" ] && [ -r "$MG_BAD" ]; then
+    echo "SKIP: $bad registry (running as root; the file is readable anyway)"
+  elif [ "$ec" != "77" ] && [ -e "$MG_DIR/reached" ] && /usr/bin/grep -q 'WARNING.*failing open' "$MG_DIR/err"; then
+    PASS=$((PASS+1)); echo "PASS: $bad registry → fails open with a warning"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: $bad registry (exit $ec, reached: $([ -e "$MG_DIR/reached" ] && echo yes || echo no))"
+  fi
+done
+
+# The config-file key works too, not just the env override.
+MG_CFG="$MG_DIR/config"
+printf 'ALLOWED_OWNERS=test-allowed-org\nMENTION_GUARD_REGISTRY=%s\n' "$MG_REG" > "$MG_CFG"
+/bin/rm -f "$MG_DIR/reached"
+GH_FILTER_CONFIG="$MG_CFG" GH_FILTER_REAL_GH="$MG_STUB" "$FILTER" pr comment 1 "$R" -b "thanks @queen" </dev/null >/dev/null 2>&1
+ec=$?
+if [ "$ec" = "77" ] && [ ! -e "$MG_DIR/reached" ]; then
+  PASS=$((PASS+1)); echo "PASS: MENTION_GUARD_REGISTRY in the config file enables the guard"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: config-file MENTION_GUARD_REGISTRY (exit $ec)"
+fi
+
+/bin/chmod 600 "$MG_DIR/unreadable.json" 2>/dev/null
+/bin/rm -rf "$MG_DIR"
+
+echo ""
 echo "================================================================"
 echo "Total: $((PASS+FAIL)) | Passed: $PASS | Failed: $FAIL"
 echo "================================================================"
