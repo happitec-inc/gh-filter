@@ -276,13 +276,14 @@ The identity stage runs `AGENT_TOKEN_COMMAND` on every agent-context call, **wit
 
 - `--version`, `--help`, `-v`, `-h`
 - `help`, `completion`, `config`, `alias`, `gpg-key`, `ssh-key`, `cache`
-- `auth` (all subcommands)
+- `auth` (every subcommand except `setup-git`)
 - `extension list`, `extension search`, `extension exec`
 
 ## Subcommands always blocked
 
 - `extension install`, `extension upgrade`, `extension remove`, `extension create`, `extension browse` — state-changing extension ops; install manually if needed
 - `api graphql` — the query body can target any repo and isn't reliably parseable
+- `auth setup-git` — writes a credential helper into the global `~/.gitconfig`, replacing the host's helper for every user of that config; authenticate per command instead (`GH_TOKEN`, or `git -c credential.helper=...`)
 
 ## Allowed `gh api` meta paths
 
