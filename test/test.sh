@@ -158,6 +158,7 @@ assert_exit "--help" 0 --help
 # extensions list is empty, so the real exit codes are 1 and 4 respectively. Use
 # assert_allow which checks "not blocked" rather than asserting a specific exit.
 assert_allow "auth status"     auth status
+assert_allow "auth token"      auth token
 assert_allow "extension list"  extension list
 
 echo ""
@@ -425,6 +426,8 @@ echo ""
 echo "=== Block: structural denies ==="
 assert_block "api graphql"                  api graphql -f query="query{}"
 assert_block "extension install"            extension install disallowed-test-owner/test-extension
+assert_block "auth setup-git"               auth setup-git
+assert_block "auth setup-git --hostname"    auth setup-git --hostname github.com
 # The "no target detectable" case must run from a directory with no git
 # remote, otherwise the filter's fallback would resolve a target and either
 # allow or block based on the remote's owner. Run from a tmp non-git dir.

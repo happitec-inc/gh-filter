@@ -388,8 +388,14 @@ case "$SUBCMD" in
     esac
     ;;
   auth)
-    # All auth-state operations: login, logout, refresh, status, setup-git,
-    # token, switch.
+    # `setup-git` writes a credential helper into the GLOBAL ~/.gitconfig,
+    # which replaces the host's helper for every agent. Measured 2026-10-19:
+    # one subagent's `GH_TOKEN=… gh auth setup-git` broke HTTPS git fleet-wide.
+    # Every other auth-state operation (login, logout, refresh, status, token,
+    # switch) passes through.
+    if [ "${2:-}" = "setup-git" ]; then
+      deny "auth:setup-git" "gh auth setup-git rewrites the global ~/.gitconfig credential helper for every agent; authenticate per command instead (GH_TOKEN, or git -c credential.helper=...)"
+    fi
     exec "$REAL_GH" "$@"
     ;;
   extension)
